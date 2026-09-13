@@ -6,6 +6,7 @@ import tempfile
 import tkinter as tk
 import unittest
 from pathlib import Path
+from tkinter import ttk
 from unittest.mock import Mock, patch
 
 import sirilmosaic
@@ -168,6 +169,7 @@ class SirilMosaicTests(unittest.TestCase):
                 app.bayer_pattern.set("GRBG")
                 app.bayer_orientation.set("Bottom-up")
                 app.cosmetic_correction.set(True)
+                app.cosmetic_cold_sigma.set(4.2)
                 app.cosmetic_hot_sigma.set(3.4)
                 app.overlap_normalization.set(False)
                 app.adaptive_quality_filtering.set(True)
@@ -189,6 +191,7 @@ class SirilMosaicTests(unittest.TestCase):
                 self.assertEqual(arguments.bayer_pattern, "GRBG")
                 self.assertEqual(arguments.bayer_orientation, "bottom-up")
                 self.assertTrue(arguments.cosmetic_correction)
+                self.assertEqual(arguments.cosmetic_cold_sigma, "4.2")
                 self.assertEqual(arguments.cosmetic_hot_sigma, "3.4")
                 self.assertFalse(arguments.overlap_normalization)
                 self.assertTrue(arguments.adaptive_quality_filtering)
@@ -202,6 +205,39 @@ class SirilMosaicTests(unittest.TestCase):
             finally:
                 root.destroy()
 
+    def test_gui_uses_hot_only_cold_sigma_default(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            self.assertEqual(app.cosmetic_cold_sigma.get(), 50.0)
+            self.assertEqual(app.cosmetic_hot_sigma.get(), 3.0)
+        finally:
+            root.destroy()
+
+    def test_gui_groups_mosaic_settings_by_processing_stage(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            SirilMosaicApp(root)
+            groups = {
+                child.cget("text")
+                for container in root.winfo_children()
+                for child in container.winfo_children()
+                if isinstance(child, ttk.LabelFrame)
+            }
+
+            self.assertTrue({
+                "Capture & CFA",
+                "Cosmetic correction",
+                "Frame selection",
+                "Integration",
+                "Background & plate solving",
+                "Resources",
+            }.issubset(groups))
+        finally:
+            root.destroy()
+
     def test_gui_run_profiles_persist_processing_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile_path = Path(directory) / "profiles.json"
@@ -213,6 +249,7 @@ class SirilMosaicTests(unittest.TestCase):
                 app.drizzle_scale.set(1.7)
                 app.bayer_pattern.set("RGGB")
                 app.cosmetic_correction.set(False)
+                app.cosmetic_cold_sigma.set(4.5)
                 app.cosmetic_hot_sigma.set(4.0)
                 app.overlap_normalization.set(False)
                 app.filter_background.set(93)
@@ -226,6 +263,7 @@ class SirilMosaicTests(unittest.TestCase):
                 app.drizzle_scale.set(2.5)
                 app.bayer_pattern.set("Auto (header)")
                 app.cosmetic_correction.set(True)
+                app.cosmetic_cold_sigma.set(2.5)
                 app.cosmetic_hot_sigma.set(2.0)
                 app.overlap_normalization.set(True)
                 app.filter_background.set(99)
@@ -239,6 +277,7 @@ class SirilMosaicTests(unittest.TestCase):
                 self.assertEqual(app.drizzle_scale.get(), 1.7)
                 self.assertEqual(app.bayer_pattern.get(), "RGGB")
                 self.assertFalse(app.cosmetic_correction.get())
+                self.assertEqual(app.cosmetic_cold_sigma.get(), 4.5)
                 self.assertEqual(app.cosmetic_hot_sigma.get(), 4.0)
                 self.assertFalse(app.overlap_normalization.get())
                 self.assertEqual(app.filter_background.get(), 93)
@@ -395,6 +434,39 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertEqual(len(sirilmosaic.discover_light_files(workdir, (output_dir,))), 4)
             fake.Close.assert_called_once_with()
 
+    def test_pipeline_closes_siril_before_cancellation_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory))
+            output_dir = Path(directory) / "output"
+            arguments = sirilmosaic.build_parser().parse_args([
+                "--workdir", str(workdir),
+                "--output-dir", str(output_dir),
+                "--siril-exe", str(executable),
+            ])
+            fake = Mock()
+            fake.Open.return_value = True
+            fake.Execute.return_value = True
+            fake.GetData.return_value = []
+            events = []
+            real_cleanup = sirilmosaic.cleanup
+
+            fake.Close.side_effect = lambda: events.append("close")
+
+            def cleanup_after_close(*args, **kwargs):
+                self.assertIn("close", events)
+                events.append("cleanup")
+                return real_cleanup(*args, **kwargs)
+
+            with patch("pysiril.siril.Siril", return_value=fake), patch(
+                "sirilmosaic.substack",
+                side_effect=sirilmosaic.CancellationRequested("test cancellation"),
+            ), patch("sirilmosaic.cleanup", side_effect=cleanup_after_close):
+                result = sirilmosaic.run_pipeline(arguments)
+
+            self.assertEqual(result, 2)
+            self.assertLess(events.index("close"), events.index("cleanup"))
+            self.assertFalse((workdir / "Lights_sorted").exists())
+
     def test_configured_commands_match_pipeline_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workdir, executable = self.make_project(Path(directory))
@@ -447,7 +519,7 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertIn("set debayer.use_bayer_header=false", fake.commands)
             self.assertIn("set debayer.pattern=1", fake.commands)
             self.assertIn("set debayer.orientation=3", fake.commands)
-            self.assertIn("seqfind_cosme_cfa light 0 3.0 -prefix=cc_", fake.commands)
+            self.assertIn("seqfind_cosme_cfa light 3.0 3.0 -prefix=cc_", fake.commands)
             self.assertIn("calibrate cc_light", fake.commands)
             self.assertNotIn("calibrate cc_light -debayer", fake.commands)
             self.assertTrue(any(command.startswith("seqsubsky pp_cc_light") for command in fake.commands))
@@ -581,7 +653,7 @@ class SirilMosaicTests(unittest.TestCase):
 
             self.assertTrue(sirilmosaic.substack(1))
 
-            correction = "seqfind_cosme_cfa light 0 3.0 -prefix=cc_"
+            correction = "seqfind_cosme_cfa light 3.0 3.0 -prefix=cc_"
             debayer = "calibrate cc_light -debayer"
             self.assertLess(fake.commands.index(correction), fake.commands.index(debayer))
             self.assertTrue(any(command.startswith("seqapplyreg bkg_pp_cc_light") for command in fake.commands))

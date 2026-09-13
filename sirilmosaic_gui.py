@@ -27,6 +27,7 @@ PROFILE_FIELDS = (
     "bayer_pattern",
     "bayer_orientation",
     "cosmetic_correction",
+    "cosmetic_cold_sigma",
     "cosmetic_hot_sigma",
     "overlap_normalization",
     "filter_background",
@@ -131,8 +132,8 @@ class SirilMosaicApp:
         self.events: Queue[tuple[str, Any]] = Queue()
 
         root.title("Siril Mosaic Stacker")
-        root.geometry("920x830")
-        root.minsize(800, 720)
+        root.geometry("1120x850")
+        root.minsize(920, 720)
         configure_dark_theme(root)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(4, weight=1)
@@ -154,6 +155,7 @@ class SirilMosaicApp:
             value=last_paths.get("bayer_orientation", "Bottom-up")
         )
         self.cosmetic_correction = tk.BooleanVar(value=True)
+        self.cosmetic_cold_sigma = tk.DoubleVar(value=50.0)
         self.cosmetic_hot_sigma = tk.DoubleVar(value=3.0)
         self.overlap_normalization = tk.BooleanVar(value=True)
         self.filter_background = tk.IntVar(value=97)
@@ -258,130 +260,166 @@ class SirilMosaicApp:
         return spinbox
 
     def _build_settings(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Mosaic settings", padding=12)
+        frame = ttk.Frame(self.root)
         frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
-        for column in (1, 3, 5):
-            frame.columnconfigure(column, weight=1)
+        for column in (0, 1):
+            frame.columnconfigure(column, weight=1, uniform="settings")
 
-        fields = (
-            ("Substacks", self.substacks, 1, 100, 1),
-            ("Drizzle scale", self.drizzle_scale, 0.1, 3.0, 0.1),
-            ("Pixel fraction", self.pixel_fraction, 0.1, 1.0, 0.1),
-            ("Background filter (%)", self.filter_background, 1, 100, 1),
-            ("Star-count filter (%)", self.filter_stars, 1, 100, 1),
-            ("Roundness filter (%)", self.filter_roundness, 1, 100, 1),
-            ("FWHM filter (%)", self.filter_fwhm, 1, 100, 1),
-            ("Feather", self.feather, 0, 1000, 1),
-            ("Low rejection", self.rejection_low, 0.1, 20.0, 0.1),
-            ("High rejection", self.rejection_high, 0.1, 20.0, 0.1),
-            ("Memory fraction", self.memory, 0.1, 1.0, 0.1),
-            ("CPU count", self.cpus, 1, 256, 1),
-            ("Retries", self.retries, 0, 20, 1),
-            ("Hot-pixel sigma", self.cosmetic_hot_sigma, 0.1, 20.0, 0.1),
-            ("Quality filter sigma", self.quality_filter_sigma, 0.1, 20.0, 0.1),
-            ("Background samples", self.background_samples, 1, 100, 1),
-            ("Background tolerance", self.background_tolerance, 0.1, 10.0, 0.1),
-        )
-        for index, (label, variable, lower, upper, increment) in enumerate(fields):
-            row, pair = divmod(index, 3)
-            spinbox = self._spinbox(frame, row, pair, label, variable, lower, upper, increment)
-            if variable is self.drizzle_scale or variable is self.pixel_fraction:
-                self.drizzle_widgets.append(spinbox)
-            if variable is self.cosmetic_hot_sigma:
-                self.cosmetic_widgets.append(spinbox)
-            if any(variable is item for item in (
-                self.filter_background,
-                self.filter_stars,
-                self.filter_roundness,
-                self.filter_fwhm,
-            )):
-                self.quality_percent_widgets.append(spinbox)
-            if variable is self.quality_filter_sigma:
-                self.quality_sigma_widgets.append(spinbox)
-            if variable is self.background_samples or variable is self.background_tolerance:
-                self.background_widgets.append(spinbox)
+        def section(title: str, row: int, column: int) -> ttk.LabelFrame:
+            group = ttk.LabelFrame(frame, text=title, padding=(10, 6))
+            group.grid(
+                row=row,
+                column=column,
+                sticky="nsew",
+                padx=(0, 5) if column == 0 else (5, 0),
+                pady=(0, 8),
+            )
+            for value_column in (1, 3):
+                group.columnconfigure(value_column, weight=1)
+            return group
 
-        ttk.Checkbutton(
-            frame,
-            text="Correct hot pixels",
-            variable=self.cosmetic_correction,
-            command=self.update_cosmetic_controls,
-        ).grid(row=5, column=4, columnspan=2, sticky="w", pady=4)
-
-        last_row = (len(fields) + 2) // 3
-        ttk.Label(frame, text="Weighting").grid(row=last_row, column=0, sticky="w", padx=(0, 6), pady=4)
-        ttk.Combobox(
-            frame,
-            textvariable=self.weight,
-            values=("wfwhm", "noise", "nbstars", "nbstack"),
-            state="readonly",
-            width=13,
-        ).grid(row=last_row, column=1, sticky="ew", padx=(0, 16), pady=4)
-        ttk.Label(frame, text="Plate catalog").grid(row=last_row, column=2, sticky="w", padx=(0, 6), pady=4)
-        ttk.Combobox(
-            frame,
-            textvariable=self.catalog,
-            values=("localgaia", "gaia", "nomad", "apass"),
-            width=13,
-        ).grid(row=last_row, column=3, sticky="ew", padx=(0, 16), pady=4)
-        ttk.Checkbutton(
-            frame,
-            text="Enable drizzle",
-            variable=self.drizzle,
-            command=self.update_drizzle_controls,
-        ).grid(row=last_row, column=4, columnspan=2, sticky="w", pady=4)
-
-        ttk.Label(frame, text="Bayer pattern").grid(
-            row=last_row + 1, column=0, sticky="w", padx=(0, 6), pady=4
+        capture = section("Capture & CFA", 0, 0)
+        self._spinbox(capture, 0, 0, "Substacks", self.substacks, 1, 100, 1)
+        ttk.Label(capture, text="Bayer pattern").grid(
+            row=0, column=2, sticky="w", padx=(0, 6), pady=4
         )
         ttk.Combobox(
-            frame,
+            capture,
             textvariable=self.bayer_pattern,
             values=("Auto (header)", "RGGB", "BGGR", "GBRG", "GRBG"),
             state="readonly",
             width=13,
-        ).grid(row=last_row + 1, column=1, sticky="ew", padx=(0, 16), pady=4)
-        ttk.Label(frame, text="CFA row order").grid(
-            row=last_row + 1, column=2, sticky="w", padx=(0, 6), pady=4
+        ).grid(row=0, column=3, sticky="ew", padx=(0, 16), pady=4)
+        ttk.Label(capture, text="CFA row order").grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=4
         )
         ttk.Combobox(
-            frame,
+            capture,
             textvariable=self.bayer_orientation,
             values=("Auto", "Top-down", "Bottom-up"),
             state="readonly",
             width=13,
-        ).grid(row=last_row + 1, column=3, sticky="ew", padx=(0, 16), pady=4)
-        ttk.Checkbutton(frame, text="Keep intermediate files", variable=self.debug).grid(
-            row=last_row + 1, column=4, columnspan=2, sticky="w", pady=4
-        )
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=4)
         ttk.Checkbutton(
-            frame,
-            text="Normalize overlaps",
-            variable=self.overlap_normalization,
-        ).grid(row=last_row + 2, column=0, columnspan=2, sticky="w", pady=4)
+            capture,
+            text="Enable drizzle",
+            variable=self.drizzle,
+            command=self.update_drizzle_controls,
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=4)
+        self.drizzle_widgets.extend((
+            self._spinbox(capture, 2, 0, "Drizzle scale", self.drizzle_scale, 0.1, 3.0, 0.1),
+            self._spinbox(capture, 2, 1, "Pixel fraction", self.pixel_fraction, 0.1, 1.0, 0.1),
+        ))
+
+        cosmetic = section("Cosmetic correction", 0, 1)
         ttk.Checkbutton(
-            frame,
+            cosmetic,
+            text="Enable cosmetic correction",
+            variable=self.cosmetic_correction,
+            command=self.update_cosmetic_controls,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=4)
+        self.cosmetic_widgets.extend((
+            self._spinbox(
+                cosmetic, 1, 0, "Cold-pixel sigma", self.cosmetic_cold_sigma, 0.1, 50.0, 0.1
+            ),
+            self._spinbox(
+                cosmetic, 1, 1, "Hot-pixel sigma", self.cosmetic_hot_sigma, 0.1, 20.0, 0.1
+            ),
+        ))
+
+        selection = section("Frame selection", 1, 0)
+        for row, pair, label, variable in (
+            (0, 0, "Background filter (%)", self.filter_background),
+            (0, 1, "Star-count filter (%)", self.filter_stars),
+            (1, 0, "Roundness filter (%)", self.filter_roundness),
+            (1, 1, "FWHM filter (%)", self.filter_fwhm),
+        ):
+            self.quality_percent_widgets.append(
+                self._spinbox(selection, row, pair, label, variable, 1, 100, 1)
+            )
+        ttk.Checkbutton(
+            selection,
             text="Adaptive quality filters",
             variable=self.adaptive_quality_filtering,
             command=self.update_quality_filter_controls,
-        ).grid(row=last_row + 2, column=2, columnspan=2, sticky="w", pady=4)
-        ttk.Checkbutton(
-            frame,
-            text="Fast normalization",
-            variable=self.fast_normalization,
-        ).grid(row=last_row + 2, column=4, columnspan=2, sticky="w", pady=4)
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+        self.quality_sigma_widgets.append(
+            self._spinbox(
+                selection, 2, 1, "Quality filter sigma", self.quality_filter_sigma, 0.1, 20.0, 0.1
+            )
+        )
 
-        ttk.Label(frame, text="Background extraction").grid(
-            row=last_row + 3, column=0, sticky="w", padx=(0, 6), pady=4
+        integration = section("Integration", 1, 1)
+        ttk.Label(integration, text="Weighting").grid(
+            row=0, column=0, sticky="w", padx=(0, 6), pady=4
         )
         ttk.Combobox(
-            frame,
+            integration,
+            textvariable=self.weight,
+            values=("wfwhm", "noise", "nbstars", "nbstack"),
+            state="readonly",
+            width=13,
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 16), pady=4)
+        self._spinbox(integration, 0, 1, "Feather", self.feather, 0, 1000, 1)
+        self._spinbox(integration, 1, 0, "Low rejection", self.rejection_low, 0.1, 20.0, 0.1)
+        self._spinbox(integration, 1, 1, "High rejection", self.rejection_high, 0.1, 20.0, 0.1)
+        ttk.Checkbutton(
+            integration,
+            text="Normalize overlaps",
+            variable=self.overlap_normalization,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(
+            integration,
+            text="Fast normalization",
+            variable=self.fast_normalization,
+        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=4)
+
+        background = section("Background & plate solving", 2, 0)
+        ttk.Label(background, text="Background extraction").grid(
+            row=0, column=0, sticky="w", padx=(0, 6), pady=4
+        )
+        ttk.Combobox(
+            background,
             textvariable=self.background_method,
             values=("Off", "Linear", "Quadratic", "RBF"),
             state="readonly",
             width=13,
-        ).grid(row=last_row + 3, column=1, sticky="ew", padx=(0, 16), pady=4)
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 16), pady=4)
+        ttk.Label(background, text="Plate catalog").grid(
+            row=0, column=2, sticky="w", padx=(0, 6), pady=4
+        )
+        ttk.Combobox(
+            background,
+            textvariable=self.catalog,
+            values=("localgaia", "gaia", "nomad", "apass"),
+            width=13,
+        ).grid(row=0, column=3, sticky="ew", padx=(0, 16), pady=4)
+        self.background_widgets.extend((
+            self._spinbox(
+                background, 1, 0, "Background samples", self.background_samples, 1, 100, 1
+            ),
+            self._spinbox(
+                background,
+                1,
+                1,
+                "Background tolerance",
+                self.background_tolerance,
+                0.1,
+                10.0,
+                0.1,
+            ),
+        ))
         self.background_method.trace_add("write", lambda *_: self.update_background_controls())
+
+        resources = section("Resources", 2, 1)
+        self._spinbox(resources, 0, 0, "Memory fraction", self.memory, 0.1, 1.0, 0.1)
+        self._spinbox(resources, 0, 1, "CPU count", self.cpus, 1, 256, 1)
+        self._spinbox(resources, 1, 0, "Retries", self.retries, 0, 20, 1)
+        ttk.Checkbutton(
+            resources,
+            text="Keep intermediate files",
+            variable=self.debug,
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=4)
 
     def _build_actions(self) -> None:
         frame = ttk.Frame(self.root, padding=(14, 0, 14, 10))
@@ -602,8 +640,11 @@ class SirilMosaicApp:
             raise ValueError("Feather cannot be negative.")
         if self.rejection_low.get() <= 0 or self.rejection_high.get() <= 0:
             raise ValueError("Rejection thresholds must be greater than 0.")
-        if self.cosmetic_correction.get() and self.cosmetic_hot_sigma.get() <= 0:
-            raise ValueError("Hot-pixel sigma must be greater than 0.")
+        if self.cosmetic_correction.get():
+            if self.cosmetic_cold_sigma.get() <= 0:
+                raise ValueError("Cold-pixel sigma must be greater than 0.")
+            if self.cosmetic_hot_sigma.get() <= 0:
+                raise ValueError("Hot-pixel sigma must be greater than 0.")
         if self.quality_filter_sigma.get() <= 0:
             raise ValueError("Quality filter sigma must be greater than 0.")
         if self.background_method.get() != "Off":
@@ -635,6 +676,7 @@ class SirilMosaicApp:
             "--bayer-pattern", bayer_pattern,
             "--bayer-orientation", bayer_orientation,
             "--cosmetic-correction" if self.cosmetic_correction.get() else "--no-cosmetic-correction",
+            "--cosmetic-cold-sigma", str(self.cosmetic_cold_sigma.get()),
             "--cosmetic-hot-sigma", str(self.cosmetic_hot_sigma.get()),
             "--overlap-normalization" if self.overlap_normalization.get() else "--no-overlap-normalization",
             "--filter-background", str(self.filter_background.get()),

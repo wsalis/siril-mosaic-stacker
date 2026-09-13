@@ -7,7 +7,7 @@ A source-safe graphical workflow for stacking large mosaics and high-frame-count
 - Restores source frames to their original locations after success, cancellation, or failure
 - Supports FITS (`.fit`, `.fits`, `.fts`) and XISF input
 - CFA metadata preflight with explicit Bayer pattern and row-orientation controls
-- Optional cosmetic hot-pixel correction and background extraction
+- Optional CFA cosmetic correction with separate cold/hot sigma controls
 - Percentage or adaptive k-sigma quality filtering
 - Drizzle, overlap normalization, rejection, weighting, and feathering controls
 - Optional fast normalization for large light-frame sets

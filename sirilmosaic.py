@@ -44,6 +44,7 @@ drizzle_enabled = True
 bayer_pattern = DEFAULT_BAYER_PATTERN
 bayer_orientation = DEFAULT_BAYER_ORIENTATION
 cosmetic_correction = True
+cosmetic_cold_sigma = '3.0'
 cosmetic_hot_sigma = '3.0'
 overlap_normalization = True
 filter_bkg = '97%'
@@ -399,6 +400,7 @@ def initialize_quality_report(input_frames):
             "bayer_pattern": bayer_pattern,
             "bayer_orientation": bayer_orientation,
             "cosmetic_correction": cosmetic_correction,
+            "cosmetic_cold_sigma": cosmetic_cold_sigma,
             "cosmetic_hot_sigma": cosmetic_hot_sigma,
             "overlap_normalization": overlap_normalization,
             "filter_background": filter_bkg,
@@ -473,9 +475,10 @@ def substack(group_num, cat=None):
     execute_siril(f"cd {siril_path(process_folder)}")
     input_sequence = "light"
     if cosmetic_correction:
-        phase(0.10, 0.16, "Correcting hot pixels")
+        phase(0.10, 0.16, "Correcting cosmetic defects")
         execute_siril(
-            f"seqfind_cosme_cfa light 0 {cosmetic_hot_sigma} -prefix=cc_"
+            f"seqfind_cosme_cfa light {cosmetic_cold_sigma} "
+            f"{cosmetic_hot_sigma} -prefix=cc_"
         )
         input_sequence = "cc_light"
     phase(0.16, 0.28, "Calibrating and debayering")
@@ -653,6 +656,7 @@ def build_parser():
         action=argparse.BooleanOptionalAction,
         default=cosmetic_correction,
     )
+    parser.add_argument("--cosmetic-cold-sigma", default=cosmetic_cold_sigma)
     parser.add_argument("--cosmetic-hot-sigma", default=cosmetic_hot_sigma)
     parser.add_argument(
         "--overlap-normalization",
@@ -697,7 +701,8 @@ def configure(arguments):
     global workdir, output_dir, siril_exe, run_id, quality_report
     global cancel_file
     global SubStack_nb, drizzle_enabled, drizzle_scale, pix_frac
-    global bayer_pattern, bayer_orientation, cosmetic_correction, cosmetic_hot_sigma
+    global bayer_pattern, bayer_orientation, cosmetic_correction
+    global cosmetic_cold_sigma, cosmetic_hot_sigma
     global overlap_normalization, adaptive_quality_filtering, quality_filter_sigma
     global background_method, background_samples, background_tolerance
     global filter_bkg, filter_nbstars, filter_round, filter_fwhm
@@ -718,6 +723,7 @@ def configure(arguments):
     bayer_pattern = arguments.bayer_pattern
     bayer_orientation = arguments.bayer_orientation
     cosmetic_correction = arguments.cosmetic_correction
+    cosmetic_cold_sigma = str(arguments.cosmetic_cold_sigma)
     cosmetic_hot_sigma = str(arguments.cosmetic_hot_sigma)
     overlap_normalization = arguments.overlap_normalization
     filter_bkg = f"{arguments.filter_background}%"
@@ -774,6 +780,7 @@ def validate_parameters():
         ("high rejection", rej_high),
     ]
     if cosmetic_correction:
+        numeric_values.append(("cosmetic cold sigma", cosmetic_cold_sigma))
         numeric_values.append(("cosmetic hot sigma", cosmetic_hot_sigma))
     if drizzle_enabled:
         numeric_values.extend((("drizzle scale", drizzle_scale), ("pixel fraction", pix_frac)))
@@ -857,6 +864,12 @@ def run_pipeline(arguments):
         if cancelled:
             print("[INFO] Cancellation requested; restoring source files...", flush=True)
         prepare_siril_for_cleanup()
+        if app is not None:
+            try:
+                app.Close()
+            except Exception:
+                pass
+            app = None
         try:
             lights_sorted = workdir / "Lights_sorted"
             if lights_sorted.is_dir():
@@ -868,20 +881,8 @@ def run_pipeline(arguments):
             if cancelled and not debug:
                 remove_tree(workdir / "substacks")
         except Exception as rollback_error:
-            if app is not None:
-                try:
-                    app.Close()
-                except Exception:
-                    pass
-                app = None
             write_quality_report("failed", f"{error}; source rollback failed: {rollback_error}")
             raise RuntimeError(f"{error}\nSource rollback also failed: {rollback_error}") from error
-        if app is not None:
-            try:
-                app.Close()
-            except Exception:
-                pass
-            app = None
         write_quality_report("cancelled" if cancelled else "failed", error)
         if cancelled:
             print("[INFO] Cancellation complete; source files restored.", flush=True)
