@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local application state
+profiles.json
+last_paths.json
+*.tmp
+*.cancel
+*.log
+siril_mosaic_logs/
+
+# Generated processing data
+Lights_sorted/
+substacks/
+Siril Mosaic Output/
+source_manifest.json
+quality_report_*.json
+master_stack*.fit
+master_stack*.fits
+master_stack*.fts
+master_stack*.xisf
+substack_*.fit
+substack_*.fits
+substack_*.fts
+substack_*.xisf
+*rejmap*.fit
+
+# Astronomy source and intermediate data
+*.fit
+*.fits
+*.fts
+*.xisf
+*.seq
