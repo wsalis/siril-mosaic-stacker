@@ -40,7 +40,7 @@ For the ZWO ASI533MC, `RGGB` with `Bottom-up` orientation is the known-good expl
 
 ## Output
 
-The selected output folder receives the final master stack, retained substacks, rejection maps when applicable, and a timestamped JSON quality report. Run logs are written beneath the source folder in `siril_mosaic_logs`.
+The selected output folder receives the final master stack and a timestamped JSON quality report. Temporary substacks and rejection maps are removed after successful normal runs; use debug mode to retain intermediates for investigation. Run logs are written beneath the source folder in `siril_mosaic_logs`.
 
 The GUI stores profiles and recently selected paths under `%APPDATA%\Siril Mosaic Stacker`; these files are not stored in this repository.
 

@@ -621,22 +621,8 @@ def masterstack(SubStack_nb):
 
 def final_cleanup():
     report_progress(98, 100, "Writing final outputs")
-    group_folder = workdir / "substacks"
-    lights_folder = group_folder / "lights"
-    rejection_maps_folder = group_folder / "rejection_maps"
-    substack_output = output_dir / "substacks"
-    substack_output.mkdir(parents=True, exist_ok=True)
-    for i in range(1, SubStack_nb + 1):
-        source = lights_folder / f"substack_{i}.fit"
-        destination = substack_output / f"substack_{i}_{run_id}.fit"
-        shutil.move(str(source), str(destination))
-    for rejection_map in rejection_maps_folder.glob("*.fit"):
-        prefix = rejection_map.name.split("_", 2)[:2]
-        substack_prefix = "_".join(prefix)
-        destination = substack_output / _run_artifact_name(rejection_map.name, substack_prefix)
-        shutil.move(str(rejection_map), str(destination))
     remove_tree(workdir / 'Lights_sorted')
-    remove_tree(group_folder)
+    remove_tree(workdir / 'substacks')
     report_progress(100, 100, "Complete")
 
 def build_parser():

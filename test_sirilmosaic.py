@@ -689,7 +689,7 @@ class SirilMosaicTests(unittest.TestCase):
             )
             self.assertIn(".txt", restored)
 
-    def test_final_cleanup_preserves_substacks(self) -> None:
+    def test_final_cleanup_removes_intermediate_substacks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workdir = Path(directory) / "project"
             lights = workdir / "substacks" / "lights"
@@ -705,9 +705,8 @@ class SirilMosaicTests(unittest.TestCase):
 
             sirilmosaic.final_cleanup()
 
-            self.assertTrue((sirilmosaic.output_dir / "substacks" / "substack_1_test_run.fit").is_file())
-            self.assertFalse(lights.exists())
-            self.assertFalse(process.exists())
+            self.assertFalse((sirilmosaic.output_dir / "substacks").exists())
+            self.assertFalse((workdir / "substacks").exists())
             self.assertFalse((workdir / "Lights_sorted").exists())
 
     def test_single_substack_becomes_master_without_siril_restack(self) -> None:
@@ -738,10 +737,8 @@ class SirilMosaicTests(unittest.TestCase):
 
             sirilmosaic.final_cleanup()
 
-            self.assertTrue((sirilmosaic.output_dir / "substacks" / "substack_1_test_run.fit").is_file())
-            self.assertTrue(
-                (sirilmosaic.output_dir / "substacks" / "substack_1_test_run_low_rejmap.fit").is_file()
-            )
+            self.assertFalse((sirilmosaic.output_dir / "substacks").exists())
+            self.assertFalse((workdir / "substacks").exists())
 
     def test_multi_substack_master_uses_selected_output_folder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
