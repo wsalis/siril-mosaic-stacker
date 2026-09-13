@@ -18,7 +18,7 @@ A source-safe graphical workflow for stacking large mosaics and high-frame-count
 
 ## Requirements
 
-- Windows 10 or 11
+- Windows 10 or 11, or macOS with a compatible Siril installation
 - Python 3.10 or newer with Tk support
 - Siril 1.4 or newer
 
@@ -39,6 +39,26 @@ python sirilmosaic_gui.py
 Choose the folder containing the source lights, a separate output folder, and the Siril executable. Review the detected frame count and CFA warning before starting.
 
 For the ZWO ASI533MC, `RGGB` with `Bottom-up` orientation is the known-good explicit selection when `ROWORDER` metadata is absent.
+
+On macOS, select the Siril executable inside the application bundle, for example:
+
+```text
+/Applications/Siril.app/Contents/MacOS/siril
+```
+
+The same Python GUI and processing pipeline can be launched with `python3 sirilmosaic_gui.py` after installing the requirements in a virtual environment.
+
+## Large Collections
+
+Siril documents a 2,048-image Windows limit for stacking operations that open all sequence images simultaneously. For large collections such as Seestar captures, enable `Auto substacks (max 2048 frames each)`. The app counts eligible FITS/XISF inputs and divides them into enough substacks to stay within that limit.
+
+Recommended starting settings for very large collections:
+
+- Enable automatic substacks
+- Keep drizzle disabled unless the larger output is needed
+- Enable failed-frame skipping for unattended runs
+- Keep debug mode disabled to reduce temporary storage
+- Leave enough free disk space for converted, calibrated, registered, and rejection-map products
 
 ## Output
 
