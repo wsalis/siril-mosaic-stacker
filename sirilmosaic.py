@@ -24,6 +24,7 @@ GENERATED_DIRECTORIES = {'lights_sorted', 'substacks', '__pycache__'}
 GENERATED_FILE_PREFIXES = ('master_stack', 'substack_')
 SOURCE_MANIFEST = 'source_manifest.json'
 STACKING_WEIGHTS = {'noise', 'wfwhm', 'nbstars', 'nbstack'}
+SIRIL_MAX_STACK_FRAMES = 2048
 BAYER_PATTERNS = {'auto': 0, 'RGGB': 0, 'BGGR': 1, 'GBRG': 2, 'GRBG': 3}
 BAYER_ORIENTATIONS = {'auto': 0, 'top-down': 2, 'bottom-up': 3}
 BACKGROUND_METHODS = {'off': None, 'linear': '1', 'quadratic': '2', 'rbf': '-rbf'}
@@ -65,6 +66,8 @@ catalog = 'localgaia'
 memory_fraction = '0.8'
 cpu_count = 28
 max_retries = 5
+skip_failed_frames = False
+auto_substacks = False
 # ==============================================
 
 def check_cancellation():
@@ -139,6 +142,30 @@ def read_cfa_metadata(path):
     except (OSError, ET.ParseError, struct.error):
         return {}
     return metadata
+
+
+def read_fits_layer_count(path):
+    path = Path(path)
+    if path.suffix.lower() not in {'.fit', '.fits', '.fts'}:
+        return None
+    header = {}
+    try:
+        with path.open('rb') as stream:
+            while block := stream.read(2880):
+                for offset in range(0, len(block), 80):
+                    card = block[offset:offset + 80].decode('ascii', errors='replace')
+                    name = card[:8].strip().upper()
+                    if name == 'END':
+                        if header.get('NAXIS') == 2:
+                            return 1
+                        if header.get('NAXIS') == 3:
+                            return header.get('NAXIS3')
+                        return None
+                    if name in {'NAXIS', 'NAXIS3'} and card[8:10] == '= ':
+                        header[name] = int(_clean_fits_value(card[10:]))
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def debayer_preflight_warnings(files, pattern, orientation):
@@ -394,6 +421,8 @@ def initialize_quality_report(input_frames):
         "input_frames": input_frames,
         "settings": {
             "substacks": SubStack_nb,
+            "auto_substacks": auto_substacks,
+            "max_frames_per_substack": SIRIL_MAX_STACK_FRAMES,
             "drizzle": drizzle_enabled,
             "drizzle_scale": drizzle_scale,
             "pixel_fraction": pix_frac,
@@ -416,6 +445,7 @@ def initialize_quality_report(input_frames):
             "rejection_low": rej_low,
             "rejection_high": rej_high,
             "fast_normalization": fast_normalization,
+            "skip_failed_frames": skip_failed_frames,
         },
         "substacks": [],
     }
@@ -432,6 +462,41 @@ def write_quality_report(status, error=None):
         json.dumps(quality_report, indent=2),
         encoding="utf-8",
     )
+
+
+def skip_invalid_sequence_frames(process_folder, sequence_name, expected_layers):
+    sequence_files = []
+    pattern = re.compile(rf'^{re.escape(sequence_name)}_(\d+)\.fit$', re.IGNORECASE)
+    for path in process_folder.glob(f'{sequence_name}_*.fit'):
+        match = pattern.match(path.name)
+        if match:
+            sequence_files.append((int(match.group(1)), path))
+    sequence_files.sort()
+    invalid = [
+        (image_number, path)
+        for image_number, path in sequence_files
+        if read_fits_layer_count(path) != expected_layers
+    ]
+    if not invalid or not skip_failed_frames:
+        return
+    execute_siril(f'select {sequence_name} 1 {sequence_files[-1][0]}')
+    for image_number, path in invalid:
+        layer_count = read_fits_layer_count(path)
+        execute_siril(f'unselect {sequence_name} {image_number} {image_number}')
+        skipped = {
+            'stage': 'calibration/debayering',
+            'sequence': sequence_name,
+            'image_number': image_number,
+            'file': path.name,
+            'reason': f'expected {expected_layers} layer(s), found {layer_count}',
+        }
+        if quality_report is not None:
+            quality_report.setdefault('skipped_frames', []).append(skipped)
+        print(f"[WARNING] Skipping failed frame {path.name}: {skipped['reason']}", flush=True)
+    if quality_report is not None:
+        write_quality_report('running')
+    if len(sequence_files) == len(invalid):
+        raise RuntimeError(f'All frames failed in sequence {sequence_name}.')
 
 
 def configure_debayer():
@@ -487,6 +552,11 @@ def substack(group_num, cat=None):
         + ("" if drizzle_enabled else " -debayer")
     )
     processed_sequence = f"pp_{input_sequence}"
+    skip_invalid_sequence_frames(
+        process_folder,
+        processed_sequence,
+        1 if drizzle_enabled else 3,
+    )
     if background_method == 'off':
         background_sequence = processed_sequence
         phase(0.28, 0.40, "Background extraction disabled")
@@ -632,6 +702,12 @@ def build_parser():
     parser.add_argument("--siril-exe", type=Path, default=siril_exe)
     parser.add_argument("--cancel-file", type=Path)
     parser.add_argument("--substacks", type=int, default=SubStack_nb)
+    parser.add_argument(
+        "--auto-substacks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="calculate the substack count to keep each sequence at or below 2048 frames",
+    )
     parser.add_argument("--drizzle", action=argparse.BooleanOptionalAction, default=drizzle_enabled)
     parser.add_argument("--drizzle-scale", default=drizzle_scale)
     parser.add_argument("--pixel-fraction", default=pix_frac)
@@ -679,6 +755,12 @@ def build_parser():
     parser.add_argument("--memory", default=memory_fraction)
     parser.add_argument("--cpus", type=int, default=cpu_count)
     parser.add_argument("--retries", type=int, default=max_retries)
+    parser.add_argument(
+        "--skip-failed-frames",
+        action=argparse.BooleanOptionalAction,
+        default=skip_failed_frames,
+        help="exclude malformed calibrated frames and record them in the log/report",
+    )
     parser.add_argument("--debug", action="store_true", help="keep intermediate files")
     return parser
 
@@ -686,14 +768,14 @@ def build_parser():
 def configure(arguments):
     global workdir, output_dir, siril_exe, run_id, quality_report
     global cancel_file
-    global SubStack_nb, drizzle_enabled, drizzle_scale, pix_frac
+    global SubStack_nb, auto_substacks, drizzle_enabled, drizzle_scale, pix_frac
     global bayer_pattern, bayer_orientation, cosmetic_correction
     global cosmetic_cold_sigma, cosmetic_hot_sigma
     global overlap_normalization, adaptive_quality_filtering, quality_filter_sigma
     global background_method, background_samples, background_tolerance
     global filter_bkg, filter_nbstars, filter_round, filter_fwhm
     global stacking_weight, feather_val, rej_low, rej_high, fast_normalization, catalog
-    global memory_fraction, cpu_count, max_retries, debug
+    global memory_fraction, cpu_count, max_retries, skip_failed_frames, debug
 
     workdir = arguments.workdir.expanduser().resolve()
     selected_output = arguments.output_dir or (workdir / "Siril Mosaic Output")
@@ -703,6 +785,7 @@ def configure(arguments):
     siril_exe = arguments.siril_exe.expanduser().resolve()
     cancel_file = arguments.cancel_file.expanduser().resolve() if arguments.cancel_file else None
     SubStack_nb = arguments.substacks
+    auto_substacks = arguments.auto_substacks
     drizzle_enabled = arguments.drizzle
     drizzle_scale = str(arguments.drizzle_scale)
     pix_frac = str(arguments.pixel_fraction)
@@ -730,10 +813,12 @@ def configure(arguments):
     memory_fraction = str(arguments.memory)
     cpu_count = arguments.cpus
     max_retries = arguments.retries
+    skip_failed_frames = arguments.skip_failed_frames
     debug = arguments.debug
 
 
 def validate_parameters():
+    global SubStack_nb
     if not workdir.is_dir():
         raise ValueError("Input folder does not exist.")
     if output_dir == workdir:
@@ -746,6 +831,13 @@ def validate_parameters():
         raise ValueError("Input folder contains no supported FITS or XISF files.")
     if not siril_exe.is_file():
         raise ValueError("Siril executable does not exist.")
+    if auto_substacks:
+        SubStack_nb = math.ceil(light_count / SIRIL_MAX_STACK_FRAMES)
+        print(
+            f"[INFO] Auto substacks: {light_count} frame(s) -> "
+            f"{SubStack_nb} substack(s), max {SIRIL_MAX_STACK_FRAMES} frames each",
+            flush=True,
+        )
     if SubStack_nb < 1:
         raise ValueError("Substack count must be at least 1.")
     if SubStack_nb > light_count:

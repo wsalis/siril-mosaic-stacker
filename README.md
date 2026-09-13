@@ -11,6 +11,8 @@ A source-safe graphical workflow for stacking large mosaics and high-frame-count
 - Percentage or adaptive k-sigma quality filtering
 - Drizzle, overlap normalization, rejection, weighting, and feathering controls
 - Optional fast normalization for large light-frame sets
+- Optional failed-frame skipping that records excluded calibrated frames in logs and JSON reports
+- Optional automatic substack sizing for large sequences (2048-frame Windows limit)
 - Progress estimates, cancellation, logs, profiles, and JSON quality reports
 - Avoids statistically weak master rejection when fewer than four substacks exist
 
@@ -41,6 +43,10 @@ For the ZWO ASI533MC, `RGGB` with `Bottom-up` orientation is the known-good expl
 ## Output
 
 The selected output folder receives the final master stack and a timestamped JSON quality report. Temporary substacks and rejection maps are removed after successful normal runs; use debug mode to retain intermediates for investigation. Run logs are written beneath the source folder in `siril_mosaic_logs`.
+
+Enable `Skip failed frames (log only)` when a single frame may fail during calibration or debayering. The stacker excludes malformed calibrated frames from later Siril sequence operations and records each skipped sequence filename, image number, stage, and reason in the run log and JSON report. The option is disabled by default; a run still fails normally when it is unchecked.
+
+Enable `Auto substacks (max 2048 frames each)` for large collections. The app counts eligible input frames and calculates the smallest number of substacks that keeps every Siril sequence at or below 2048 frames. Manual substack selection remains available when this option is disabled.
 
 The GUI stores profiles and recently selected paths under `%APPDATA%\Siril Mosaic Stacker`; these files are not stored in this repository.
 

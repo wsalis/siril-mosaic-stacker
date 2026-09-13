@@ -21,6 +21,7 @@ from sirilmosaic import debayer_preflight_warnings, discover_light_files
 
 PROFILE_FIELDS = (
     "substacks",
+    "auto_substacks",
     "drizzle",
     "drizzle_scale",
     "pixel_fraction",
@@ -48,6 +49,7 @@ PROFILE_FIELDS = (
     "memory",
     "cpus",
     "retries",
+    "skip_failed_frames",
     "debug",
 )
 
@@ -147,6 +149,7 @@ class SirilMosaicApp:
         self.workdir = tk.StringVar(value=last_paths.get("workdir", r"G:\Rosette"))
         self.siril_exe = tk.StringVar(value=r"C:\Program Files\Siril\bin\siril.exe")
         self.substacks = tk.IntVar(value=2)
+        self.auto_substacks = tk.BooleanVar(value=False)
         self.drizzle = tk.BooleanVar(value=True)
         self.drizzle_scale = tk.DoubleVar(value=2.0)
         self.pixel_fraction = tk.DoubleVar(value=0.8)
@@ -176,6 +179,7 @@ class SirilMosaicApp:
         self.memory = tk.DoubleVar(value=0.8)
         self.cpus = tk.IntVar(value=min(28, os.cpu_count() or 1))
         self.retries = tk.IntVar(value=5)
+        self.skip_failed_frames = tk.BooleanVar(value=False)
         self.debug = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Choose a folder; FITS and XISF frames in its subfolders are included.")
         self.progress_text = tk.StringVar(value="0.0% estimated - Waiting to start")
@@ -184,6 +188,7 @@ class SirilMosaicApp:
         self.quality_percent_widgets: list[ttk.Spinbox] = []
         self.quality_sigma_widgets: list[ttk.Spinbox] = []
         self.background_widgets: list[ttk.Spinbox] = []
+        self.substacks_widget: ttk.Spinbox | None = None
         self.output_dir = tk.StringVar(
             value=last_paths.get("output_dir", r"G:\Rosette\Siril Mosaic Output")
         )
@@ -194,6 +199,7 @@ class SirilMosaicApp:
         self._build_paths()
         self._build_settings()
         self.update_drizzle_controls()
+        self.update_substack_controls()
         self.update_cosmetic_controls()
         self.update_quality_filter_controls()
         self.update_background_controls()
@@ -279,7 +285,7 @@ class SirilMosaicApp:
             return group
 
         capture = section("Capture & CFA", 0, 0)
-        self._spinbox(capture, 0, 0, "Substacks", self.substacks, 1, 100, 1)
+        self.substacks_widget = self._spinbox(capture, 0, 0, "Substacks", self.substacks, 1, 100, 1)
         ttk.Label(capture, text="Bayer pattern").grid(
             row=0, column=2, sticky="w", padx=(0, 6), pady=4
         )
@@ -310,6 +316,12 @@ class SirilMosaicApp:
             self._spinbox(capture, 2, 0, "Drizzle scale", self.drizzle_scale, 0.1, 3.0, 0.1),
             self._spinbox(capture, 2, 1, "Pixel fraction", self.pixel_fraction, 0.1, 1.0, 0.1),
         ))
+        ttk.Checkbutton(
+            capture,
+            text="Auto substacks (max 2048 frames each)",
+            variable=self.auto_substacks,
+            command=self.update_substack_controls,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=4)
 
         cosmetic = section("Cosmetic correction", 0, 1)
         ttk.Checkbutton(
@@ -420,6 +432,11 @@ class SirilMosaicApp:
             text="Keep intermediate files",
             variable=self.debug,
         ).grid(row=1, column=2, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(
+            resources,
+            text="Skip failed frames (log only)",
+            variable=self.skip_failed_frames,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=4)
 
     def _build_actions(self) -> None:
         frame = ttk.Frame(self.root, padding=(14, 0, 14, 10))
@@ -540,6 +557,7 @@ class SirilMosaicApp:
         for field in PROFILE_FIELDS:
             if field in profile:
                 getattr(self, field).set(profile[field])
+        self.update_substack_controls()
         self.update_drizzle_controls()
         self.update_cosmetic_controls()
         self.update_quality_filter_controls()
@@ -588,6 +606,11 @@ class SirilMosaicApp:
         for widget in self.drizzle_widgets:
             widget.configure(state=state)
 
+    def update_substack_controls(self) -> None:
+        if self.substacks_widget is not None:
+            state = "disabled" if self.auto_substacks.get() else "normal"
+            self.substacks_widget.configure(state=state)
+
     def update_cosmetic_controls(self) -> None:
         state = "normal" if self.cosmetic_correction.get() else "disabled"
         for widget in self.cosmetic_widgets:
@@ -621,7 +644,7 @@ class SirilMosaicApp:
             raise ValueError("Input folder contains no supported FITS or XISF files.")
         if not executable.is_file():
             raise ValueError("Choose an existing Siril executable.")
-        if not 1 <= self.substacks.get() <= frame_count:
+        if not self.auto_substacks.get() and not 1 <= self.substacks.get() <= frame_count:
             raise ValueError("Substacks must be between 1 and the number of input frames.")
         if self.drizzle.get():
             if not 0 < self.drizzle_scale.get() <= 3:
@@ -670,6 +693,7 @@ class SirilMosaicApp:
             "--output-dir", str(output_dir),
             "--siril-exe", str(executable),
             "--substacks", str(self.substacks.get()),
+            "--auto-substacks" if self.auto_substacks.get() else "--no-auto-substacks",
             "--drizzle" if self.drizzle.get() else "--no-drizzle",
             "--drizzle-scale", str(self.drizzle_scale.get()),
             "--pixel-fraction", str(self.pixel_fraction.get()),
@@ -698,6 +722,7 @@ class SirilMosaicApp:
             "--memory", str(self.memory.get()),
             "--cpus", str(self.cpus.get()),
             "--retries", str(self.retries.get()),
+            "--skip-failed-frames" if self.skip_failed_frames.get() else "--no-skip-failed-frames",
         ]
         if self.debug.get():
             command.append("--debug")

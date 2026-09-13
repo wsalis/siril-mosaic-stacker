@@ -33,6 +33,20 @@ class FakeSiril:
 
 
 class SirilMosaicTests(unittest.TestCase):
+    def write_fits_layer_header(self, path: Path, layers: int) -> None:
+        cards = [
+            "SIMPLE  =                    T",
+            "BITPIX  =                   32",
+            f"NAXIS   =                    {2 if layers == 1 else 3}",
+            "NAXIS1  =                   10",
+            "NAXIS2  =                   10",
+        ]
+        if layers != 1:
+            cards.append(f"NAXIS3  =                    {layers}")
+        cards.append("END")
+        header = b"".join(card.ljust(80).encode("ascii") for card in cards)
+        path.write_bytes(header.ljust(2880, b" "))
+
     def make_project(self, root: Path, light_count: int = 4) -> tuple[Path, Path]:
         workdir = root / "project"
         workdir.mkdir(parents=True)
@@ -150,6 +164,54 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertEqual(report["status"], "complete")
             self.assertEqual(report["run_id"], "test_run")
 
+    def test_failed_frames_can_be_unselected_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory)
+            self.write_fits_layer_header(process / "pp_light_00001.fit", 3)
+            self.write_fits_layer_header(process / "pp_light_00002.fit", 1)
+            self.write_fits_layer_header(process / "pp_light_00003.fit", 3)
+            fake = FakeSiril()
+            sirilmosaic.app = fake
+            sirilmosaic.skip_failed_frames = True
+            sirilmosaic.quality_report = {}
+            sirilmosaic.output_dir = process
+            sirilmosaic.run_id = "failed_frame_test"
+
+            sirilmosaic.skip_invalid_sequence_frames(process, "pp_light", 3)
+
+            self.assertEqual(
+                fake.commands,
+                ["select pp_light 1 3", "unselect pp_light 2 2"],
+            )
+            self.assertEqual(sirilmosaic.quality_report["skipped_frames"][0]["file"], "pp_light_00002.fit")
+
+    def test_failed_frame_skip_setting_is_disabled_by_default(self) -> None:
+        arguments = sirilmosaic.build_parser().parse_args([])
+        self.assertFalse(arguments.skip_failed_frames)
+
+    def test_auto_substacks_resolves_to_siril_frame_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=4)
+            arguments = sirilmosaic.build_parser().parse_args([
+                "--workdir", str(workdir),
+                "--siril-exe", str(executable),
+                "--substacks", "1",
+                "--auto-substacks",
+            ])
+            sirilmosaic.configure(arguments)
+            sirilmosaic.validate_parameters()
+
+            self.assertEqual(sirilmosaic.SubStack_nb, 1)
+            self.assertEqual(sirilmosaic.SIRIL_MAX_STACK_FRAMES, 2048)
+
+            with patch(
+                "sirilmosaic.discover_light_files",
+                return_value=[workdir / f"light_{index}.fit" for index in range(2049)],
+            ):
+                sirilmosaic.validate_parameters()
+
+            self.assertEqual(sirilmosaic.SubStack_nb, 2)
+
     def test_gui_maps_all_core_inputs_to_cli(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workdir, executable = self.make_project(Path(directory))
@@ -162,6 +224,7 @@ class SirilMosaicTests(unittest.TestCase):
                 app.output_dir.set(str(output_dir))
                 app.siril_exe.set(str(executable))
                 app.substacks.set(3)
+                app.auto_substacks.set(True)
                 app.drizzle_scale.set(1.5)
                 app.filter_background.set(94)
                 app.debug.set(True)
@@ -178,6 +241,7 @@ class SirilMosaicTests(unittest.TestCase):
                 app.background_samples.set(30)
                 app.background_tolerance.set(1.3)
                 app.fast_normalization.set(True)
+                app.skip_failed_frames.set(True)
 
                 command = app.command()
                 arguments = sirilmosaic.build_parser().parse_args(command[3:])
@@ -186,6 +250,7 @@ class SirilMosaicTests(unittest.TestCase):
                 self.assertEqual(arguments.output_dir, output_dir)
                 self.assertEqual(arguments.siril_exe, executable)
                 self.assertEqual(arguments.substacks, 3)
+                self.assertTrue(arguments.auto_substacks)
                 self.assertEqual(arguments.drizzle_scale, "1.5")
                 self.assertEqual(arguments.filter_background, 94)
                 self.assertEqual(arguments.bayer_pattern, "GRBG")
@@ -200,6 +265,7 @@ class SirilMosaicTests(unittest.TestCase):
                 self.assertEqual(arguments.background_samples, 30)
                 self.assertEqual(arguments.background_tolerance, 1.3)
                 self.assertTrue(arguments.fast_normalization)
+                self.assertTrue(arguments.skip_failed_frames)
                 self.assertTrue(arguments.debug)
                 self.assertFalse(arguments.drizzle)
             finally:
