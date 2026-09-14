@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tkinter as tk
@@ -17,11 +18,23 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from astro_dark_theme import DARK_BORDER, DARK_FIELD, DARK_TEXT, configure_dark_theme
-from sirilmosaic import debayer_preflight_warnings, discover_light_files
+from sirilmosaic import (
+    build_selection_filters,
+    debayer_preflight_warnings,
+    discover_light_files,
+    estimate_peak_storage_bytes,
+    summarize_frame_cohorts,
+    summarize_input_frames,
+)
 
 PROFILE_FIELDS = (
+    "test_frame_count",
+    "coverage_map",
+    "auto_crop_master",
+    "auto_crop_coverage_percent",
     "substacks",
     "auto_substacks",
+    "mosaic_aware_star_count",
     "drizzle",
     "drizzle_scale",
     "pixel_fraction",
@@ -56,6 +69,49 @@ PROFILE_FIELDS = (
 SIRIL_PROCESS_NAMES = {"siril", "siril.exe", "siril-cli", "siril-cli.exe"}
 PROGRESS_MARKER = re.compile(r"^\[PROGRESS\]\s+([0-9.]+)\s+([0-9.]+)\s+(.+)$")
 SIRIL_PROGRESS = re.compile(r"^\s*progress:\s*([0-9.]+)%", re.IGNORECASE)
+
+HELP_TEXT = """SIRIL MOSAIC STACKER 1.4
+
+QUICK START
+1. Install Python 3.10+ with Tk support, Siril 1.4+, and the packages in requirements.txt.
+2. Choose the folder containing your light frames. FITS (.fit, .fits, .fts) and XISF files are found recursively.
+3. Choose a separate output folder and the Siril executable itself.
+4. For a first run, leave Test frame count at 0, use one substack if the sequence is below Siril's limit, and keep drizzle disabled.
+5. Choose Bayer pattern and row orientation when working with CFA data. Review the preflight count, storage estimate, and warnings.
+6. Start the run. The source files are staged temporarily, processed, and restored to their original relative paths.
+7. Inspect the master, the timestamped log, and the JSON quality report in the output folder.
+
+SOURCE SAFETY
+The application records every moved file in source_manifest.json. It refuses to use a non-empty Lights_sorted folder, restores sources after success or cancellation, and protects a pre-existing staging folder from rollback cleanup. Do not edit Lights_sorted while a run is active. Debug mode retains generated intermediates but still restores source frames; remove those intermediates before another run.
+
+INPUTS AND GROUPING
+Input files may be mixed FITS extensions or XISF. Test frame count randomly samples eligible files while leaving unselected files in place. Substacks split the selected files into randomized, non-empty groups before final integration. Auto substacks calculates enough groups to keep each Siril sequence at or below the 8,192-frame Windows limit. More groups require more intermediate storage and currently disable coverage-map autocrop.
+
+CFA AND PREPROCESSING
+Bayer pattern controls the CFA color layout; Auto reads headers where possible. CFA row order controls sensor orientation; explicit Top-down or Bottom-up can resolve missing or unreliable ROWORDER metadata. Optional cosmetic correction repairs hot/cold CFA pixels before debayering; higher sigma values are more conservative. Background extraction supports Off, RBF, and Quadratic modes with configurable samples and tolerance.
+
+FRAME SELECTION
+Percentage mode keeps the requested best whole-number percentage for each enabled criterion: background, star count, roundness, and FWHM. These criteria intersect, so setting every value to 90% does not guarantee 90% overall retention. Adaptive mode replaces all percentage fields with one positive k-sigma threshold. Disabled fields are ignored and do not block validation.
+Mosaic-aware star count removes star count from global rejection when frames cover different sky regions; the other criteria remain active. The experimental sky-quality filter is unsupported and values other than 100 are rejected. The relative filter-retention score in reports is diagnostic only, not an objective sky-quality or Bortle measurement.
+
+REGISTRATION AND INTEGRATION
+Drizzle increases output sampling and needs substantially more time and disk space. Weighting controls registered-frame contribution. Feather blends mosaic borders. Low/high rejection removes unusual pixel values. Overlap normalization can reduce brightness differences between panels but may be slow. Fast normalization can reduce processing time for large sets. Master rejection is avoided for fewer than four substacks because it is statistically weak.
+
+COVERAGE AND AUTOCROP
+Write coverage map creates coverage_map_<run>.fit, a normalized 0-1 viewing map, and integration_time_map_<run>.fit, which stores seconds per pixel. Exposure is counted wherever registered frames contain finite nonzero signal. Create auto-cropped master preserves the full master and writes the largest rectangle meeting Crop depth (%) relative to the median nonblank integration time. The default is 50%; this is a coverage threshold, not an area percentage. Positive EXPTIME is required for every registered frame. Coverage and autocrop currently require one substack; this is intentionally reported as unavailable for multiple substacks rather than guessed.
+
+REPORTS, RETRIES, AND CANCELLATION
+The JSON report schema version 2 records effective filters, acquisition cohorts, stage counts, discarded-frame diagnostics, command durations, Siril response tails, retry failures, and exact exposure telemetry when metadata and stack membership are known. Candidate filters are possible run-wide causes, not proven per-frame causes. Integrated exposure is reported as unavailable when exact membership cannot be established; no proportional estimate is invented. Retries restart failed substack commands from cleaned generated products. Cancellation stops retrying, closes Siril, restores sources, and returns safely.
+
+PROFILES AND RESOURCES
+Profiles save processing controls and are stored under %APPDATA%\\Siril Mosaic Stacker. The last successfully loaded or saved profile is restored at startup; merely changing the dropdown does not change the remembered profile. Memory fraction, CPU count, retry count, and storage estimates help control resource use. Leave free space for converted, calibrated, registered, and rejection-map products.
+
+ACQUISITION COHORTS
+Preflight and reports group frames by camera, exposure, gain, filter, and dimensions. Cohorts are diagnostic; grouping remains randomized and quality filters remain global.
+
+PLATFORM NOTES
+On Windows, select siril.exe. On macOS, select /Applications/Siril.app/Contents/MacOS/siril. For an ASI533MC with missing ROWORDER metadata, RGGB with Bottom-up is the known-good starting point documented by this project.
+"""
 
 
 class RunProgressEstimator:
@@ -148,8 +204,13 @@ class SirilMosaicApp:
 
         self.workdir = tk.StringVar(value=last_paths.get("workdir", r"G:\Rosette"))
         self.siril_exe = tk.StringVar(value=r"C:\Program Files\Siril\bin\siril.exe")
+        self.test_frame_count = tk.IntVar(value=0)
+        self.coverage_map = tk.BooleanVar(value=False)
+        self.auto_crop_master = tk.BooleanVar(value=False)
+        self.auto_crop_coverage_percent = tk.IntVar(value=50)
         self.substacks = tk.IntVar(value=2)
         self.auto_substacks = tk.BooleanVar(value=False)
+        self.mosaic_aware_star_count = tk.BooleanVar(value=False)
         self.drizzle = tk.BooleanVar(value=True)
         self.drizzle_scale = tk.DoubleVar(value=2.0)
         self.pixel_fraction = tk.DoubleVar(value=0.8)
@@ -189,11 +250,15 @@ class SirilMosaicApp:
         self.quality_sigma_widgets: list[ttk.Spinbox] = []
         self.background_widgets: list[ttk.Spinbox] = []
         self.substacks_widget: ttk.Spinbox | None = None
+        self.star_count_widget: ttk.Spinbox | None = None
+        self.coverage_widgets: list[tk.Widget] = []
         self.output_dir = tk.StringVar(
             value=last_paths.get("output_dir", r"G:\Rosette\Siril Mosaic Output")
         )
-        self.profile_name = tk.StringVar()
+        self.profile_name = tk.StringVar(value=last_paths.get("profile_name", ""))
         self.profiles = self._read_profiles()
+        self.last_used_profile = self.profile_name.get() if self.profile_name.get() in self.profiles else ""
+        self.profile_name.set(self.last_used_profile)
 
         self._build_profiles()
         self._build_paths()
@@ -202,9 +267,12 @@ class SirilMosaicApp:
         self.update_substack_controls()
         self.update_cosmetic_controls()
         self.update_quality_filter_controls()
+        self.update_coverage_controls()
         self.update_background_controls()
         self._build_actions()
         self._build_log()
+        if self.profile_name.get() in self.profiles:
+            self.load_profile(notify=False)
         root.after(100, self.poll_events)
 
     def _build_profiles(self) -> None:
@@ -240,6 +308,18 @@ class SirilMosaicApp:
         ttk.Label(frame, text="Siril executable").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Entry(frame, textvariable=self.siril_exe).grid(row=2, column=1, sticky="ew", pady=(8, 0))
         ttk.Button(frame, text="Choose...", command=self.choose_siril).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(frame, text="Test frame count (0 = all)").grid(
+            row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Spinbox(
+            frame,
+            from_=0,
+            to=1000000,
+            increment=1,
+            textvariable=self.test_frame_count,
+            width=12,
+        ).grid(row=3, column=1, sticky="w", pady=(8, 0))
 
     def _spinbox(
         self,
@@ -318,7 +398,7 @@ class SirilMosaicApp:
         ))
         ttk.Checkbutton(
             capture,
-            text="Auto substacks (max 2048 frames each)",
+            text="Auto substacks (max 8192 frames each)",
             variable=self.auto_substacks,
             command=self.update_substack_controls,
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=4)
@@ -346,15 +426,22 @@ class SirilMosaicApp:
             (1, 0, "Roundness filter (%)", self.filter_roundness),
             (1, 1, "FWHM filter (%)", self.filter_fwhm),
         ):
-            self.quality_percent_widgets.append(
-                self._spinbox(selection, row, pair, label, variable, 1, 100, 1)
-            )
+            widget = self._spinbox(selection, row, pair, label, variable, 1, 100, 1)
+            self.quality_percent_widgets.append(widget)
+            if label == "Star-count filter (%)":
+                self.star_count_widget = widget
         ttk.Checkbutton(
             selection,
             text="Adaptive quality filters",
             variable=self.adaptive_quality_filtering,
             command=self.update_quality_filter_controls,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(
+            selection,
+            text="Mosaic-aware star count",
+            variable=self.mosaic_aware_star_count,
+            command=self.update_quality_filter_controls,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=4)
         self.quality_sigma_widgets.append(
             self._spinbox(
                 selection, 2, 1, "Quality filter sigma", self.quality_filter_sigma, 0.1, 20.0, 0.1
@@ -385,6 +472,25 @@ class SirilMosaicApp:
             text="Fast normalization",
             variable=self.fast_normalization,
         ).grid(row=2, column=2, columnspan=2, sticky="w", pady=4)
+        coverage_check = ttk.Checkbutton(
+            integration,
+            text="Write coverage map",
+            variable=self.coverage_map,
+            command=self.update_coverage_controls,
+        )
+        coverage_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+        crop_check = ttk.Checkbutton(
+            integration,
+            text="Create auto-cropped master",
+            variable=self.auto_crop_master,
+            command=self.update_coverage_controls,
+        )
+        crop_check.grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
+        crop_percent = self._spinbox(
+            integration, 4, 0, "Crop depth (%)", self.auto_crop_coverage_percent, 1, 100, 1
+        )
+        self.coverage_widgets.extend((crop_check, crop_percent))
+        self.update_coverage_controls()
 
         background = section("Background & plate solving", 2, 0)
         ttk.Label(background, text="Background extraction").grid(
@@ -441,16 +547,48 @@ class SirilMosaicApp:
     def _build_actions(self) -> None:
         frame = ttk.Frame(self.root, padding=(14, 0, 14, 10))
         frame.grid(row=3, column=0, sticky="ew")
-        frame.columnconfigure(3, weight=1)
+        frame.columnconfigure(4, weight=1)
         self.start_button = ttk.Button(frame, text="Start Mosaic Stack", command=self.start, style="Primary.TButton")
         self.start_button.grid(row=0, column=0)
         self.cancel_button = ttk.Button(frame, text="Cancel Run", command=self.cancel, state="disabled")
         self.cancel_button.grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(frame, text="Help", command=self.show_help).grid(row=0, column=2, padx=(8, 0))
         self.progress = ttk.Progressbar(frame, mode="determinate", maximum=100, length=210)
-        self.progress.grid(row=0, column=2, padx=(12, 0))
-        ttk.Label(frame, textvariable=self.progress_text).grid(row=0, column=3, sticky="w", padx=(12, 0))
+        self.progress.grid(row=0, column=3, padx=(12, 0))
+        ttk.Label(frame, textvariable=self.progress_text).grid(row=0, column=4, sticky="w", padx=(12, 0))
         ttk.Label(frame, textvariable=self.status).grid(
-            row=1, column=0, columnspan=4, sticky="w", pady=(6, 0)
+            row=1, column=0, columnspan=5, sticky="w", pady=(6, 0)
+        )
+
+    def show_help(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Siril Mosaic Stacker Help")
+        dialog.geometry("780x680")
+        dialog.minsize(620, 480)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        text = tk.Text(
+            dialog,
+            wrap="word",
+            padx=14,
+            pady=12,
+            background=DARK_FIELD,
+            foreground=DARK_TEXT,
+            insertbackground=DARK_TEXT,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        text.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=12)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.insert("1.0", HELP_TEXT)
+        text.configure(state="disabled")
+        ttk.Button(dialog, text="Close", command=dialog.destroy).grid(
+            row=1, column=0, columnspan=2, pady=(0, 12)
         )
 
     def _build_log(self) -> None:
@@ -497,7 +635,7 @@ class SirilMosaicApp:
             return {}
         return {
             name: value
-            for name in ("workdir", "output_dir", "bayer_pattern", "bayer_orientation")
+            for name in ("workdir", "output_dir", "bayer_pattern", "bayer_orientation", "profile_name")
             if isinstance((value := data.get(name)), str) and value
         }
 
@@ -512,6 +650,7 @@ class SirilMosaicApp:
                     "output_dir": self.output_dir.get().strip(),
                     "bayer_pattern": self.bayer_pattern.get(),
                     "bayer_orientation": self.bayer_orientation.get(),
+                    "profile_name": self.last_used_profile,
                 },
                 indent=2,
             ),
@@ -545,6 +684,8 @@ class SirilMosaicApp:
         self.profiles[name] = self._profile_values()
         self._write_profiles()
         self.profile_name.set(name)
+        self.last_used_profile = name
+        self._write_last_paths()
         self.status.set(f"Saved profile: {name}")
 
     def load_profile(self, notify: bool = True) -> None:
@@ -561,7 +702,10 @@ class SirilMosaicApp:
         self.update_drizzle_controls()
         self.update_cosmetic_controls()
         self.update_quality_filter_controls()
+        self.update_coverage_controls()
         self.update_background_controls()
+        self.last_used_profile = name
+        self._write_last_paths()
         self.status.set(f"Loaded profile: {name}")
 
     def delete_profile(self, notify: bool = True) -> None:
@@ -575,6 +719,9 @@ class SirilMosaicApp:
         del self.profiles[name]
         self._write_profiles()
         self.profile_name.set("")
+        if self.last_used_profile == name:
+            self.last_used_profile = ""
+        self._write_last_paths()
         self.status.set(f"Deleted profile: {name}")
 
     def choose_workdir(self) -> None:
@@ -623,6 +770,15 @@ class SirilMosaicApp:
             widget.configure(state=percent_state)
         for widget in self.quality_sigma_widgets:
             widget.configure(state=sigma_state)
+        if self.star_count_widget is not None:
+            star_state = "disabled" if self.mosaic_aware_star_count.get() else percent_state
+            self.star_count_widget.configure(state=star_state)
+
+    def update_coverage_controls(self) -> None:
+        crop_state = "normal" if self.coverage_map.get() else "disabled"
+        self.auto_crop_master.set(self.auto_crop_master.get() and self.coverage_map.get())
+        for widget in self.coverage_widgets:
+            widget.configure(state=crop_state)
 
     def update_background_controls(self) -> None:
         state = "disabled" if self.background_method.get() == "Off" else "normal"
@@ -642,23 +798,32 @@ class SirilMosaicApp:
         frame_count = len(discover_light_files(workdir, (output_dir,)))
         if frame_count == 0:
             raise ValueError("Input folder contains no supported FITS or XISF files.")
+        if not 0 <= self.test_frame_count.get() <= frame_count:
+            raise ValueError("Test frame count must be 0 or no more than the input frame count.")
         if not executable.is_file():
             raise ValueError("Choose an existing Siril executable.")
         if not self.auto_substacks.get() and not 1 <= self.substacks.get() <= frame_count:
             raise ValueError("Substacks must be between 1 and the number of input frames.")
+        if self.auto_crop_master.get() and not self.coverage_map.get():
+            raise ValueError("Auto-cropped master requires Write coverage map.")
+        if not 1 <= self.auto_crop_coverage_percent.get() <= 100:
+            raise ValueError("Crop coverage percentage must be from 1 to 100.")
         if self.drizzle.get():
             if not 0 < self.drizzle_scale.get() <= 3:
                 raise ValueError("Drizzle scale must be greater than 0 and no more than 3.")
             if not 0 < self.pixel_fraction.get() <= 1:
                 raise ValueError("Pixel fraction must be greater than 0 and no more than 1.")
-        for label, value in (
-            ("Background filter", self.filter_background.get()),
-            ("Star-count filter", self.filter_stars.get()),
-            ("Roundness filter", self.filter_roundness.get()),
-            ("FWHM filter", self.filter_fwhm.get()),
-        ):
-            if not 1 <= value <= 100:
-                raise ValueError(f"{label} must be from 1 to 100 percent.")
+        adaptive = self.adaptive_quality_filtering.get()
+        mosaic_aware = self.mosaic_aware_star_count.get()
+        percentages = {} if adaptive else {
+            'bkg': self.filter_background.get(),
+            'round': self.filter_roundness.get(),
+            'fwhm': self.filter_fwhm.get(),
+        }
+        if not adaptive and not mosaic_aware:
+            percentages['nbstars'] = self.filter_stars.get()
+        sigma = self.quality_filter_sigma.get() if adaptive else None
+        build_selection_filters(adaptive, sigma, percentages, mosaic_aware)
         if self.feather.get() < 0:
             raise ValueError("Feather cannot be negative.")
         if self.rejection_low.get() <= 0 or self.rejection_high.get() <= 0:
@@ -668,8 +833,6 @@ class SirilMosaicApp:
                 raise ValueError("Cold-pixel sigma must be greater than 0.")
             if self.cosmetic_hot_sigma.get() <= 0:
                 raise ValueError("Hot-pixel sigma must be greater than 0.")
-        if self.quality_filter_sigma.get() <= 0:
-            raise ValueError("Quality filter sigma must be greater than 0.")
         if self.background_method.get() != "Off":
             if self.background_samples.get() < 1:
                 raise ValueError("Background samples must be at least 1.")
@@ -692,6 +855,7 @@ class SirilMosaicApp:
             "--workdir", str(workdir),
             "--output-dir", str(output_dir),
             "--siril-exe", str(executable),
+            "--test-frame-count", str(self.test_frame_count.get()),
             "--substacks", str(self.substacks.get()),
             "--auto-substacks" if self.auto_substacks.get() else "--no-auto-substacks",
             "--drizzle" if self.drizzle.get() else "--no-drizzle",
@@ -703,13 +867,8 @@ class SirilMosaicApp:
             "--cosmetic-cold-sigma", str(self.cosmetic_cold_sigma.get()),
             "--cosmetic-hot-sigma", str(self.cosmetic_hot_sigma.get()),
             "--overlap-normalization" if self.overlap_normalization.get() else "--no-overlap-normalization",
-            "--filter-background", str(self.filter_background.get()),
-            "--filter-stars", str(self.filter_stars.get()),
-            "--filter-roundness", str(self.filter_roundness.get()),
-            "--filter-fwhm", str(self.filter_fwhm.get()),
             "--adaptive-quality-filtering" if self.adaptive_quality_filtering.get()
             else "--no-adaptive-quality-filtering",
-            "--quality-filter-sigma", str(self.quality_filter_sigma.get()),
             "--background-method", self.background_method.get().lower(),
             "--background-samples", str(self.background_samples.get()),
             "--background-tolerance", str(self.background_tolerance.get()),
@@ -723,7 +882,20 @@ class SirilMosaicApp:
             "--cpus", str(self.cpus.get()),
             "--retries", str(self.retries.get()),
             "--skip-failed-frames" if self.skip_failed_frames.get() else "--no-skip-failed-frames",
+            "--mosaic-aware-star-count"
+            if self.mosaic_aware_star_count.get() else "--no-mosaic-aware-star-count",
+            "--coverage-map" if self.coverage_map.get() else "--no-coverage-map",
+            "--auto-crop-master" if self.auto_crop_master.get() else "--no-auto-crop-master",
+            "--auto-crop-coverage-percent", str(self.auto_crop_coverage_percent.get()),
         ]
+        if adaptive:
+            command.extend(("--quality-filter-sigma", str(sigma)))
+        else:
+            for name, option in (
+                ('bkg', 'background'), ('nbstars', 'stars'), ('round', 'roundness'), ('fwhm', 'fwhm')
+            ):
+                if name in percentages:
+                    command.extend((f"--filter-{option}", str(percentages[name])))
         if self.debug.get():
             command.append("--debug")
         return command
@@ -733,6 +905,59 @@ class SirilMosaicApp:
         self.log.insert("end", message + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        amount = float(value)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if amount < 1024 or unit == "TB":
+                return f"{amount:.1f} {unit}"
+            amount /= 1024
+        return f"{amount:.1f} TB"
+
+    @staticmethod
+    def _available_space(path: Path) -> int:
+        candidate = path
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        return shutil.disk_usage(candidate).free
+
+    def _preflight_summary(self, workdir: Path, output_dir: Path) -> str:
+        files = discover_light_files(workdir, (output_dir,))
+        summary = summarize_input_frames(files)
+        requested_test_count = self.test_frame_count.get()
+        effective_count = requested_test_count or summary["frames"]
+        estimate = estimate_peak_storage_bytes(summary["bytes"], self.drizzle.get())
+        work_available = self._available_space(workdir)
+        output_available = self._available_space(output_dir)
+        available = min(work_available, output_available)
+        exposure_text = (
+            f"{summary['total_exposure_seconds'] / 3600:.2f} hours"
+            if summary["known_exposure_frames"] else "unknown"
+        )
+        capacity = "SUFFICIENT" if available >= estimate else "LOW"
+        return (
+            f"Frames: {summary['frames']}\n"
+            f"Frames this run: {effective_count}\n"
+            f"Input data: {self._format_bytes(summary['bytes'])}\n"
+            f"Estimated peak working space: {self._format_bytes(estimate)}\n"
+            f"Available on work drive: {self._format_bytes(work_available)}\n"
+            f"Available on output drive: {self._format_bytes(output_available)}\n"
+            f"Peak-space check across both drives: {capacity}\n"
+            f"Known exposure time: {exposure_text} "
+            f"({summary['known_exposure_frames']}/{summary['frames']} frames)"
+        )
+
+    def _cohort_summary(self, workdir: Path, output_dir: Path) -> str:
+        files = discover_light_files(workdir, (output_dir,))
+        cohorts = summarize_frame_cohorts(files)
+        lines = [f"Acquisition cohorts: {len(cohorts)}"]
+        for cohort in cohorts[:12]:
+            lines.append(f"- {cohort['count']} frames: {cohort['id']}")
+        if len(cohorts) > 12:
+            lines.append(f"- ... {len(cohorts) - 12} more cohorts")
+        lines.append("Cohorts are reported for review; current grouping remains randomized.")
+        return "\n".join(lines)
 
     def update_progress_display(self) -> None:
         self.progress.configure(value=self.progress_estimator.percent)
@@ -753,9 +978,13 @@ class SirilMosaicApp:
         warnings = debayer_preflight_warnings(
             discover_light_files(workdir, (output_dir,)), pattern, orientation
         )
+        storage_summary = self._preflight_summary(workdir, output_dir)
+        cohort_summary = self._cohort_summary(workdir, output_dir)
         confirmation = (
             "Frames in the selected folder will be moved temporarily into randomized substack folders. "
-            "Do not interrupt disk operations. Continue?"
+            "Do not interrupt disk operations.\n\n"
+            f"Storage and exposure preflight:\n{storage_summary}\n\n"
+            f"{cohort_summary}\n\nContinue?"
         )
         if warnings:
             confirmation = "Debayer preflight warning:\n\n" + "\n".join(
@@ -894,13 +1123,37 @@ class SirilMosaicApp:
                         self.progress_estimator.complete()
                         self.update_progress_display()
                         self.status.set("Complete")
+                        integration_message = ""
+                        if self.quality_report_path is not None and self.quality_report_path.is_file():
+                            try:
+                                report = json.loads(
+                                    self.quality_report_path.read_text(encoding="utf-8")
+                                )
+                                integration = report.get("integration", {})
+                                if integration.get("integrated_hours") is not None:
+                                    integration_message = (
+                                        f"\nIntegrated data: "
+                                        f"{integration['integrated_hours']:.2f} hours"
+                                    )
+                                else:
+                                    integration_message = "\nIntegrated data: unavailable (see quality report)"
+                                sky_condition = report.get("sky_condition", {})
+                                if sky_condition.get("score") is not None:
+                                    integration_message += (
+                                        f"\nRelative filter retention: "
+                                        f"{sky_condition['score']:.1f}/100 "
+                                        f"({sky_condition.get('classification', 'Unknown')})"
+                                    )
+                            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                                pass
                         report_message = (
                             f"\nQuality report: {self.quality_report_path}"
                             if self.quality_report_path is not None else ""
                         )
                         messagebox.showinfo(
                             "Siril Mosaic Stacker",
-                            f"Mosaic stack completed successfully.\n\nLog: {self.log_path}{report_message}",
+                            f"Mosaic stack completed successfully.{integration_message}"
+                            f"\n\nLog: {self.log_path}{report_message}",
                         )
                     else:
                         self.status.set(f"Failed (exit code {payload})")

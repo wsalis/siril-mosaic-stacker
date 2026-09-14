@@ -1,6 +1,6 @@
 [project]
 name = "siril-mosaic-stacker"
-version = "1.0.0"
+version = "1.4.0"
 description = "Source-safe graphical mosaic stacking workflow for Siril"
 readme = "README.md"
 requires-python = ">=3.10"
