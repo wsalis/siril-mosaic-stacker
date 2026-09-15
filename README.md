@@ -16,36 +16,6 @@ Small word of warning, though using the overlap normalization feature sounds nic
 
 Happy stacking!
 
-## Overview
-
-Siril Mosaic Stacker is an automated Python front end for [Siril](https://siril.org/) focused specifically on stacking. It was created to handle mixed mosaic astrophotography data that does not divide neatly into traditional tiles, such as observations of the same deep-sky object collected over multiple years with different orientations or equipment.
-
-It can cosmetic-correct light files, remove gradients, register and integrate each group, and create a final registered master stack. Automatic filtering helps identify potentially poor data in large collections. When the data can be processed as a single stack, the optional auto-crop feature can also create a cropped master.
-
-The goal is a largely single-click workflow: place your raw light files in a directory, point the application to that directory, and start the run. Depending on the selected options, the output can include a master stack, cropped master, high/low rejection maps, a mosaic coverage map showing where integration time is concentrated, and a frame-selection quality report.
-
-The application is suitable for both dedicated-rig data with larger files and longer exposures, and large numbers of smart-scope light frames with smaller files and shorter exposures.
-
-### Overlap Normalization Warning
-
-Overlap normalization can be useful for dedicated-rig data, but it is computationally expensive. Avoid enabling it for collections containing thousands of smart-scope light frames; it can make processing extremely slow. Fast normalization is available, but overlap normalization is still best reserved for smaller datasets, such as a few hundred dedicated-rig light files.
-
-Happy stacking!
-
-In a nutshell, this is an automated Python front end into [Siril](https://siril.org/) specifically for stacking. This project came about because I wanted and needed a way to stack mixed mosaic astrophotography data that doesn't get nicely grouped into tiles for traditional stacking. For example, data gathered of the same deep sky object over multiple years where orientation and equipment may differ.
-
-It cosmetic corrects light files, corrects for gradients, registers and integrates each group, then creates a final registered master stack.
-
-There are also some auto-filtering features to help filter out potentially bad data from large datasets. There's also an autocrop feature if you're able to do everything as a single stack for the moment. I'll work on a way to autocrop if there are multiple substacks as I go.
-
-Overall, this gives a pretty good single-click process and let your computer do the work. You just load up your raw light files into a directory, point the application to that directory, and run. After a while you will get a master stack, a cropped stack (if you chose to autocrop), high/low rejection files, a mosaic coverage map (indicates which parts of the master stack have the most integration time), and a frame selection quality report.
-
-This is suitable for both dedicated rig data (larger files, longer exposures) and large numbers of smart scope lights (smaller files, shorter exposures).
-
-Small word of warning, though using the overlap normalization feature sounds nice, you really only want to use it when you are stacking dedicated rig data where you aren't dealing with thousands of files. If you enable this when you have lots of lights to process, it runs that process very slowly. There's a fast normalization option but really you don't want to enable this if you're doing work with a bunch of smart scope light frames. It's better for when you're working with a few hundred light files.
-
-Happy stacking!
-
 ## Highlights
 
 - Restores source frames to their original locations after success, cancellation, or failure
