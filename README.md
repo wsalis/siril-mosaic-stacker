@@ -32,7 +32,19 @@ Overlap normalization can be useful for dedicated-rig data, but it is computatio
 
 Happy stacking!
 
-A source-safe graphical workflow for stacking large mosaics and high-frame-count image sets with [Siril](https://siril.org/). It groups source frames into randomized substacks, registers and integrates each group, then creates a final registered master stack.
+In a nutshell, this is an automated Python front end into [Siril](https://siril.org/) specifically for stacking. This project came about because I wanted and needed a way to stack mixed mosaic astrophotography data that doesn't get nicely grouped into tiles for traditional stacking. For example, data gathered of the same deep sky object over multiple years where orientation and equipment may differ.
+
+It cosmetic corrects light files, corrects for gradients, registers and integrates each group, then creates a final registered master stack.
+
+There are also some auto-filtering features to help filter out potentially bad data from large datasets. There's also an autocrop feature if you're able to do everything as a single stack for the moment. I'll work on a way to autocrop if there are multiple substacks as I go.
+
+Overall, this gives a pretty good single-click process and let your computer do the work. You just load up your raw light files into a directory, point the application to that directory, and run. After a while you will get a master stack, a cropped stack (if you chose to autocrop), high/low rejection files, a mosaic coverage map (indicates which parts of the master stack have the most integration time), and a frame selection quality report.
+
+This is suitable for both dedicated rig data (larger files, longer exposures) and large numbers of smart scope lights (smaller files, shorter exposures).
+
+Small word of warning, though using the overlap normalization feature sounds nice, you really only want to use it when you are stacking dedicated rig data where you aren't dealing with thousands of files. If you enable this when you have lots of lights to process, it runs that process very slowly. There's a fast normalization option but really you don't want to enable this if you're doing work with a bunch of smart scope light frames. It's better for when you're working with a few hundred light files.
+
+Happy stacking!
 
 ## Highlights
 
