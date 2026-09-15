@@ -6,16 +6,29 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 import tempfile
+import zipfile
 import tkinter as tk
 import unittest
 import numpy as np
+from queue import Queue
 from pathlib import Path
 from tkinter import ttk
 from unittest.mock import Mock, patch
 
 import sirilmosaic
-from sirilmosaic_gui import RunProgressEstimator, SirilMosaicApp, terminate_siril_descendants
+from sirilmosaic_gui import (
+    RunProgressEstimator,
+    SirilMosaicApp,
+    HELP_SECTIONS,
+    HELP_SECTION_ORDER,
+    cohort_balance_rows,
+    compare_run_summaries,
+    quality_metric_summary,
+    report_history_summary,
+    terminate_siril_descendants,
+)
 
 
 class FakeSiril:
@@ -30,7 +43,16 @@ class FakeSiril:
             self.cwd = target if target.is_absolute() else (self.cwd / target).resolve()
         elif command.startswith("stack ") and "-out=../substack_" in command:
             output_name = command.split("-out=../", 1)[1].split()[0]
-            (self.cwd.parent / f"{output_name}.fit").touch()
+            cards = [
+                "SIMPLE  =                    T",
+                "BITPIX  =                   32",
+                "NAXIS   =                    2",
+                "NAXIS1  =                   10",
+                "NAXIS2  =                   10",
+                "END",
+            ]
+            header = b"".join(card.ljust(80).encode("ascii") for card in cards)
+            (self.cwd.parent / f"{output_name}.fit").write_bytes(header.ljust(2880, b" "))
         return command != self.failed_command
 
     def GetData(self) -> list[str]:
@@ -129,6 +151,10 @@ class SirilMosaicTests(unittest.TestCase):
                 '--coverage-map', '--auto-crop-master', '--auto-crop-coverage-percent', '50',
                 '--adaptive-quality-filtering', '--quality-filter-sigma', '3',
                 '--mosaic-aware-star-count', '--skip-failed-frames', '--cpus', '4',
+                '--plate-solve-order', '3', '--no-plate-solve-downscale',
+                '--rbf-smoothing', '0.5', '--background-dither',
+                '--registration-transform', 'homography',
+                '--registration-interpolation', 'lanczos4', '--seed', '12345',
             ]
             result = subprocess.run(
                 command, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=240,
@@ -137,6 +163,13 @@ class SirilMosaicTests(unittest.TestCase):
             report_path = next((root / 'Siril Mosaic Output').glob('quality_report_*.json'))
             report = json.loads(report_path.read_text())
             self.assertEqual(report['status'], 'complete')
+            self.assertEqual(report['report_schema_version'], 3)
+            self.assertEqual(report['seed'], 12345)
+            self.assertTrue(report['configuration_hash'])
+            self.assertTrue(Path(report['input_manifest']).is_file())
+            self.assertTrue(Path(report['journal_path']).is_file())
+            self.assertTrue(report['environment']['siril_version'])
+            self.assertTrue(all('response_tail' in command for command in report['commands']))
             self.assertTrue(report['integration']['exposure_complete'])
             self.assertEqual(report['integration']['integrated_exposure_seconds'],
                              report['integration']['stacked_frames'] * 60)
@@ -200,6 +233,373 @@ class SirilMosaicTests(unittest.TestCase):
         estimator.complete()
         self.assertEqual(estimator.percent, 100.0)
         self.assertEqual(estimator.phase, "Complete")
+        self.assertIsNone(estimator.file_total)
+
+    def test_analysis_summary_helpers_report_history_quality_cohorts_and_deltas(self) -> None:
+        report_path = Path("quality_report_demo.json")
+        report = {
+            "run_id": "demo",
+            "status": "complete",
+            "updated_at": "2026-09-14T12:00:00",
+            "input_frames": 4,
+            "integration": {"stacked_frames": 3, "integrated_hours": 0.25},
+        }
+        summary = report_history_summary(report_path, report)
+        records = [
+            {"cohort": "A", "status": "stacked", "exposure_seconds": 60, "filter_metrics": {"fwhm": {"value": 2, "threshold": 3}}},
+            {"cohort": "A", "status": "rejected", "exposure_seconds": 60, "filter_metrics": {"fwhm": {"value": 4, "threshold": 3}}},
+            {"cohort": "B", "status": "stacked", "exposure_seconds": 120, "filter_metrics": {"fwhm": {"value": 3, "threshold": 3}}},
+        ]
+
+        metric = quality_metric_summary(records, "fwhm")
+        cohorts = cohort_balance_rows(records)
+        comparison = compare_run_summaries(summary, {**summary, "run_id": "later", "stacked_frames": 4})
+
+        self.assertEqual(summary["stacked_frames"], 3)
+        self.assertEqual(metric["count"], 3)
+        self.assertEqual(metric["threshold"], 3)
+        self.assertEqual([row["cohort"] for row in cohorts], ["A", "B"])
+        self.assertEqual(comparison["stacked_frames_delta"], 1)
+
+    def test_quality_metric_summary_ignores_nonpositive_placeholders(self) -> None:
+        summary = quality_metric_summary([
+            {"filter_metrics": {"fwhm": {"value": 0}}},
+            {"filter_metrics": {"fwhm": {"value": 2.0, "threshold": 3.0}}},
+            {"filter_metrics": {"fwhm": {"value": -1.0}}},
+        ], "fwhm")
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["ignored_nonpositive"], 2)
+
+    def test_quality_explorer_redraws_cached_histogram_on_canvas_resize(self) -> None:
+        app = SirilMosaicApp.__new__(SirilMosaicApp)
+        summary = {"metric": "fwhm", "values": [2.1, 2.4]}
+        app.quality_summary_data = summary
+        with patch.object(app, "_draw_quality_histogram") as draw:
+            app._quality_canvas_configured()
+        draw.assert_called_once_with(summary)
+
+    def test_threshold_sync_updates_basic_selection_and_disables_adaptive(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            app.threshold_vars["background"].set(83)
+            app.threshold_vars["roundness"].set(87)
+            app.threshold_vars["fwhm"].set(91)
+            app.threshold_vars["stars"].set(79)
+            app.adaptive_quality_filtering.set(True)
+            app.sync_threshold_to_frame_selection()
+            self.assertEqual(app.filter_background.get(), 83)
+            self.assertEqual(app.filter_roundness.get(), 87)
+            self.assertEqual(app.filter_fwhm.get(), 91)
+            self.assertEqual(app.filter_stars.get(), 79)
+            self.assertFalse(app.adaptive_quality_filtering.get())
+        finally:
+            root.destroy()
+
+    def test_frame_inspector_has_filter_and_clear_controls(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+
+            def button_labels(widget: tk.Misc) -> list[str]:
+                labels = []
+                for child in widget.winfo_children():
+                    if isinstance(child, ttk.Button):
+                        labels.append(str(child.cget("text")))
+                    labels.extend(button_labels(child))
+                return labels
+
+            frame_tab = app.frame_inspector_tree.master.master.master
+            labels = button_labels(frame_tab)
+            self.assertIn("Filter", labels)
+            self.assertIn("Clear Sort & Filter", labels)
+        finally:
+            root.destroy()
+
+    def test_run_review_keeps_cleanup_after_filter_controls(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            summary_frame = app.review_summary.master
+            verification_bar = next(
+                child for child in summary_frame.winfo_children()
+                if isinstance(child, ttk.Frame)
+            )
+            filter_group = next(
+                child for child in verification_bar.winfo_children()
+                if isinstance(child, ttk.Frame)
+                and any(
+                    isinstance(button, ttk.Button) and button.cget("text") == "Filter"
+                    for button in child.winfo_children()
+                )
+            )
+            filter_column = int(filter_group.grid_info()["column"])
+            cleanup = next(
+                child for child in verification_bar.winfo_children()
+                if isinstance(child, ttk.Button) and child.cget("text") == "Cleanup Review"
+            )
+            self.assertGreater(int(cleanup.grid_info()["column"]), filter_column)
+            visible_buttons = {
+                str(child.cget("text"))
+                for child in verification_bar.winfo_children()
+                if isinstance(child, ttk.Button)
+            }
+            self.assertNotIn("Replay Filters", visible_buttons)
+            self.assertNotIn("Integrity Scan", visible_buttons)
+        finally:
+            root.destroy()
+
+    def test_recovery_actions_are_on_main_action_row(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            action_frame = app.start_button.master
+            recovery_group = next(
+                child for child in action_frame.winfo_children()
+                if isinstance(child, ttk.Frame)
+                and {
+                    str(button.cget("text"))
+                    for button in child.winfo_children()
+                    if isinstance(button, ttk.Button)
+                } == {
+                    "Checkpoint Status",
+                    "Discard Checkpoint",
+                    "Abandon Run",
+                    "Run Lock Status",
+                    "Break Run Lock",
+                }
+            )
+            self.assertEqual(int(recovery_group.grid_info()["column"]), 7)
+            self.assertEqual(recovery_group.grid_info()["sticky"], "e")
+        finally:
+            root.destroy()
+
+    def test_treeview_headers_toggle_ascending_and_descending(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            tree = ttk.Treeview(root, columns=("value",), show="headings")
+            tree.heading("value", text="Value")
+            tree.insert("", "end", iid="high", values=("10",))
+            tree.insert("", "end", iid="low", values=("2",))
+            app._make_treeview_sortable(tree)
+            app._sort_treeview(tree, "value")
+            self.assertEqual(tree.get_children(), ("low", "high"))
+            app._sort_treeview(tree, "value")
+            self.assertEqual(tree.get_children(), ("high", "low"))
+            app._clear_treeview_sort_filter(tree)
+            self.assertEqual(tree.get_children(), ("high", "low"))
+        finally:
+            root.destroy()
+
+    def test_treeview_filter_uses_dropdowns_for_finite_values(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            tree = ttk.Treeview(root, columns=("status", "exposure", "file", "reason"), show="headings")
+            for column in tree["columns"]:
+                tree.heading(column, text=column.title())
+            tree.insert("", "end", iid="stacked", values=("stacked", "60.0", "M 16_001.fit", ""))
+            tree.insert("", "end", iid="rejected", values=("rejected", "60.0", "M 16_002.fit", "FWHM"))
+            tree.insert("", "end", iid="failed", values=("failed", "120.0", "M 16_003.fit", "Siril"))
+            app._make_treeview_sortable(tree)
+
+            def dialog_buttons(dialog: tk.Toplevel) -> list[ttk.Button]:
+                result = []
+                for child in dialog.winfo_children():
+                    if isinstance(child, ttk.Button):
+                        result.append(child)
+                    elif isinstance(child, tk.Misc):
+                        result.extend(dialog_buttons(child))
+                return result
+
+            app._open_treeview_filter(tree)
+            root.update_idletasks()
+            dialog = next(
+                child for child in root.winfo_children()
+                if isinstance(child, tk.Toplevel) and child.title() == "Filter table"
+            )
+            combos = [child for child in dialog.winfo_children() if isinstance(child, ttk.Combobox)]
+            column_combo, value_combo = combos
+            column_combo.set("Status")
+            column_combo.event_generate("<<ComboboxSelected>>")
+            root.update_idletasks()
+            self.assertEqual(tuple(value_combo["values"]), ("All values", "failed", "rejected", "stacked"))
+            value_combo.set("rejected")
+            next(button for button in dialog_buttons(dialog) if button.cget("text") == "Apply").invoke()
+            self.assertEqual(tree.get_children(), ("rejected",))
+
+            app._clear_treeview_sort_filter(tree)
+            app._open_treeview_filter(tree)
+            root.update_idletasks()
+            dialog = next(
+                child for child in root.winfo_children()
+                if isinstance(child, tk.Toplevel) and child.title() == "Filter table"
+            )
+            column_combo = next(child for child in dialog.winfo_children() if isinstance(child, ttk.Combobox))
+            entries = [
+                child for child in dialog.winfo_children()
+                if isinstance(child, ttk.Entry) and not isinstance(child, ttk.Combobox)
+            ]
+            value_combo = [child for child in dialog.winfo_children() if isinstance(child, ttk.Combobox)][1]
+            column_combo.set("File")
+            column_combo.event_generate("<<ComboboxSelected>>")
+            entries[0].insert(0, "M 16_002")
+            self.assertFalse(value_combo.winfo_ismapped())
+            next(button for button in dialog_buttons(dialog) if button.cget("text") == "Apply").invoke()
+            self.assertEqual(tree.get_children(), ("rejected",))
+        finally:
+            root.destroy()
+
+    def test_treeview_clear_sort_filter_restores_captured_rows(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            tree = ttk.Treeview(root, columns=("value",), show="headings")
+            tree.heading("value", text="Value")
+            tree.insert("", "end", iid="one", values=("one",))
+            tree.insert("", "end", iid="two", values=("two",))
+            app._tree_filter_snapshot[str(tree)] = app._treeview_rows(tree)
+            tree.delete("one")
+            app._clear_treeview_sort_filter(tree)
+            self.assertEqual(tree.get_children(), ("one", "two"))
+        finally:
+            root.destroy()
+
+    def test_run_history_highlights_loaded_report(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            first = Path("first.json").resolve()
+            second = Path("second.json").resolve()
+            history_style = ttk.Style(root)
+            self.assertEqual(
+                history_style.lookup("LoadedHistory.Treeview", "background", ("selected",)),
+                "#2f6f4e",
+            )
+            first_item = app.history_tree.insert("", "end", values=("first",))
+            second_item = app.history_tree.insert("", "end", values=("second",))
+            app.history_item_paths = {first_item: first, second_item: second}
+            app.quality_report_path = second
+
+            app._update_loaded_history_highlight()
+
+            self.assertFalse(app.history_tree.item(first_item, "tags"))
+            self.assertEqual(app.history_tree.item(second_item, "tags"), ("loaded_run",))
+        finally:
+            root.destroy()
+
+    def test_run_history_selection_activates_and_refreshes_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = SirilMosaicApp.__new__(SirilMosaicApp)
+            report_path = Path(directory) / "quality_report_selected.json"
+            report_path.write_text("{}", encoding="utf-8")
+            app.history_tree = Mock()
+            app.history_tree.selection.return_value = ("selected",)
+            app.history_item_paths = {"selected": report_path}
+            app.history_summary = None
+            app.quality_report_path = None
+            app.crop_report = Mock()
+            app.status = Mock()
+            app.refresh_run_review = Mock()
+            app.load_crop_report = Mock()
+            summary = {
+                "run_id": "selected",
+                "updated_at": "2026-09-14T12:00:00",
+                "status": "complete",
+                "input_frames": 1,
+                "stacked_frames": 1,
+                "rejected_frames": 0,
+                "verification": "PASS",
+            }
+            with patch("sirilmosaic_gui.json.loads", return_value={}), patch(
+                "sirilmosaic_gui.report_history_summary", return_value=summary
+            ):
+                app._history_selection_changed()
+
+            self.assertEqual(app.quality_report_path, report_path)
+            app.crop_report.set.assert_called_once_with(str(report_path))
+            app.load_crop_report.assert_called_once_with(report_path, notify=False)
+            app.refresh_run_review.assert_called_once_with(report_path)
+
+    def test_gui_tooltip_catalog_covers_core_processing_options(self) -> None:
+        self.assertIn("Enable drizzle", SirilMosaicApp.TOOLTIP_TEXT)
+        self.assertIn("Adaptive quality filters", SirilMosaicApp.TOOLTIP_TEXT)
+        self.assertIn("Write coverage map", SirilMosaicApp.TOOLTIP_TEXT)
+        self.assertIn("Random seed (blank = generate)", SirilMosaicApp.TOOLTIP_TEXT)
+        self.assertGreater(len(SirilMosaicApp.TOOLTIP_TEXT), 30)
+
+    def test_tooltip_hide_clears_shared_popup_and_pending_callback(self) -> None:
+        app = SirilMosaicApp.__new__(SirilMosaicApp)
+        app.root = Mock()
+        app._tooltip_after = "after-id"
+        popup = Mock()
+        app._tooltip_popup = popup
+        app._tooltip_widget = Mock()
+
+        app._hide_tooltip()
+
+        app.root.after_cancel.assert_called_once_with("after-id")
+        popup.destroy.assert_called_once_with()
+        self.assertIsNone(app._tooltip_after)
+        self.assertIsNone(app._tooltip_popup)
+        self.assertIsNone(app._tooltip_widget)
+
+    def test_help_sections_cover_each_major_module(self) -> None:
+        expected = (
+            "Basic", "Advanced", "Batch Queue", "Run History", "Run Review",
+            "Cohort Balance", "Quality Explorer", "Threshold Lab", "Frame Inspector",
+            "Coverage Inspector", "Visual QA", "Cropping Workbench",
+        )
+        self.assertEqual(HELP_SECTION_ORDER, expected)
+        for section in expected:
+            self.assertIn(section, HELP_SECTIONS)
+            self.assertGreater(len(HELP_SECTIONS[section]), 100)
+
+    def test_visual_quality_check_and_html_report_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master = root / "master.fit"
+            coverage = root / "coverage.fit"
+            crop = root / "crop.fit"
+            array = np.full((20, 20), 10, dtype=np.float32)
+            sirilmosaic._write_coverage_fits(master, array, unit="adu")
+            sirilmosaic._write_coverage_fits(coverage, array, unit="s")
+            sirilmosaic._write_coverage_fits(crop, array[2:18, 2:18], unit="adu")
+            qa = sirilmosaic.visual_quality_check(master, coverage, crop)
+            self.assertIn(qa["status"], {"PASS", "WARN"})
+            self.assertTrue(any(check["name"] == "master_artifact" for check in qa["checks"]))
+
+            report_path = self._write_verifiable_run(root)
+            html_path = sirilmosaic.export_html_run_report(report_path)
+            contents = html_path.read_text(encoding="utf-8")
+            self.assertIn("<!doctype html>", contents)
+            self.assertIn("Verification", contents)
+            self.assertNotIn("light_01.fit", contents)
+
+    def test_progress_estimator_interpolates_file_counts(self) -> None:
+        estimator = RunProgressEstimator()
+
+        self.assertTrue(
+            estimator.consume("[PROGRESS] 20.00 40.00 files=0-5000/5000 Converting frames")
+        )
+        self.assertEqual(estimator.file_current, 0)
+        self.assertEqual(estimator.file_total, 5000)
+        self.assertTrue(estimator.consume("progress: 50.00%"))
+        self.assertEqual(estimator.file_current, 2500)
+
+        self.assertTrue(
+            estimator.consume("[PROGRESS] 40.00 50.00 Source staging complete")
+        )
+        self.assertIsNone(estimator.file_total)
 
     def test_output_folder_is_excluded_from_source_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -313,6 +713,20 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertEqual(destination.read_text(encoding="ascii"), "new")
 
+    def test_move_replace_failure_preserves_existing_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "new.fit"
+            destination = root / "existing.fit"
+            source.write_text("new", encoding="ascii")
+            destination.write_text("old", encoding="ascii")
+
+            with patch.object(sirilmosaic.os, 'replace', side_effect=OSError('synthetic replace failure')):
+                with self.assertRaises(OSError):
+                    sirilmosaic.move_replace(source, destination)
+            self.assertTrue(source.exists())
+            self.assertEqual(destination.read_text(encoding="ascii"), "old")
+
     def test_count_sequence_files_ignores_non_sequence_fits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -369,6 +783,82 @@ class SirilMosaicTests(unittest.TestCase):
         self.assertTrue(np.all(selected >= bounds['threshold']))
         self.assertGreater(selected.size, 12)
 
+    def test_crop_workbench_plan_matches_master_and_inverts_siril_y(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master = root / "master_stack.fit"
+            integration = root / "integration_time_map.fit"
+            sirilmosaic._write_coverage_fits(
+                master,
+                np.linspace(1, 100, 100, dtype=np.float32).reshape(10, 10),
+                unit="adu",
+            )
+            coverage = np.zeros((10, 10), dtype=np.float32)
+            coverage[2:8, 1:9] = 10
+            sirilmosaic._write_coverage_fits(integration, coverage, unit="s")
+
+            plan = sirilmosaic.build_crop_plan(master, integration, 50)
+
+            self.assertEqual(plan["crop_bounds"], {"x": 1, "y": 2, "width": 8, "height": 6})
+            self.assertEqual(
+                plan["crop_siril_selection"],
+                {"x": 1, "y": 2, "width": 8, "height": 6},
+            )
+            self.assertEqual(plan["area_percent"], 48.0)
+            full_preview = sirilmosaic.read_fits_preview(master, max_width=4, max_height=4)
+            crop_preview = sirilmosaic.read_fits_preview(
+                master, plan["crop_bounds"], max_width=4, max_height=4
+            )
+            self.assertEqual(full_preview.shape, (4, 4, 3))
+            self.assertEqual(crop_preview.shape, (3, 4, 3))
+            self.assertEqual(full_preview.dtype, np.uint8)
+
+    def test_crop_workbench_cli_writes_distinct_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master = root / "master_stack.fit"
+            integration = root / "integration_time_map.fit"
+            output = root / "master_stack_crop_050pct.fit"
+            executable = root / "siril.exe"
+            executable.touch()
+            self.write_fits_layer_header(master, 1)
+            coverage = np.zeros((10, 10), dtype=np.float32)
+            coverage[2:8, 1:9] = 10
+            sirilmosaic._write_coverage_fits(integration, coverage, unit="s")
+            fake = Mock()
+            fake.Open.return_value = True
+            commands = []
+
+            def execute(command: str) -> bool:
+                commands.append(command)
+                if command.startswith("save "):
+                    output.touch()
+                return True
+
+            fake.Execute.side_effect = execute
+            arguments = sirilmosaic.build_parser().parse_args([
+                "--siril-exe", str(executable),
+                "--crop-workbench",
+                "--crop-workbench-master", str(master),
+                "--crop-workbench-coverage", str(integration),
+                "--crop-workbench-percent", "50",
+                "--crop-workbench-output", str(output),
+            ])
+            with patch("pysiril.siril.Siril", return_value=fake):
+                result = sirilmosaic.main([
+                    "--siril-exe", str(executable),
+                    "--crop-workbench",
+                    "--crop-workbench-master", str(master),
+                    "--crop-workbench-coverage", str(integration),
+                    "--crop-workbench-percent", "50",
+                    "--crop-workbench-output", str(output),
+                ])
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output.is_file())
+            self.assertIn("boxselect 1 2 8 6", commands)
+            self.assertEqual(fake.Close.call_count, 1)
+
     def test_coverage_crop_matches_exhaustive_maximum_area(self) -> None:
         generator = np.random.default_rng(314)
         for _ in range(30):
@@ -383,6 +873,80 @@ class SirilMosaicTests(unittest.TestCase):
                             if np.all(coverage[top:bottom, left:right] >= threshold):
                                 expected_area = max(expected_area, (bottom - top) * (right - left))
             self.assertEqual(bounds['width'] * bounds['height'], expected_area)
+
+    def test_compose_substack_coverage_maps_preserves_overlap_and_orientation(self) -> None:
+        local_maps = {
+            1: np.array([[1, 1, 1], [1, 1, 1]], dtype=np.float32),
+            2: np.array([[2, 2, 2], [2, 2, 2]], dtype=np.float32),
+        }
+        placements = [
+            {'number': 1, 'included': True, 'width': 3, 'height': 2, 'h02': 0, 'h12': 0},
+            {'number': 2, 'included': True, 'width': 3, 'height': 2, 'h02': 2, 'h12': 0},
+        ]
+
+        composed = sirilmosaic._compose_coverage_arrays(local_maps, placements)
+
+        self.assertEqual(composed.shape, (3, 6))
+        np.testing.assert_array_equal(composed, np.array([
+            [1, 1, 3, 2, 2, 0],
+            [1, 1, 3, 2, 2, 0],
+            [0, 0, 0, 0, 0, 0],
+        ], dtype=np.float32))
+
+    def test_compose_substack_coverage_maps_writes_final_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "process"
+            local_dir = root / "local_maps"
+            process.mkdir()
+            local_dir.mkdir()
+            (process / "r_pp_light_.seq").write_text(
+                "S 'r_pp_light_' 1 2 2 5 0 7 1 0 0\n"
+                "L 3\n"
+                "I 1 1 3,2\n"
+                "I 2 1 3,2\n"
+                "R0 1 1 1 1 1 1 H 1 0 0 0 1 0 0 0 1\n"
+                "R0 1 1 1 1 1 1 H 1 0 2 0 1 0 0 0 1\n",
+                encoding="ascii",
+            )
+            sirilmosaic._write_coverage_fits(
+                local_dir / "integration_time_map_substack_1.fit",
+                np.ones((2, 3), dtype=np.float32),
+                unit="s",
+            )
+            sirilmosaic._write_coverage_fits(
+                local_dir / "integration_time_map_substack_2.fit",
+                np.full((2, 3), 2, dtype=np.float32),
+                unit="s",
+            )
+            with patch.multiple(
+                sirilmosaic,
+                workdir=root,
+                output_dir=root / "output",
+                run_id="compose",
+                quality_report={
+                    "substack_coverages": {
+                        "1": {"frames_counted": 2, "exposure_range_seconds": [60, 60]},
+                        "2": {"frames_counted": 3, "exposure_range_seconds": [60, 300]},
+                    }
+                },
+                coverage_map_enabled=True,
+                active_cohort_tag=None,
+                active_cohort_id=None,
+            ):
+                report = sirilmosaic.compose_substack_coverage_maps(process, local_dir, 2)
+
+            self.assertEqual(report["frames_counted"], 5)
+            self.assertEqual(report["maximum_integration_seconds"], 3)
+            self.assertEqual(report["width"], 6)
+            self.assertEqual(report["height"], 3)
+            self.assertTrue(Path(report["integration_time_path"]).is_file())
+            composed = sirilmosaic._read_fits_array(Path(report["integration_time_path"]))
+            np.testing.assert_array_equal(composed, np.array([
+                [1, 1, 3, 2, 2, 0],
+                [1, 1, 3, 2, 2, 0],
+                [0, 0, 0, 0, 0, 0],
+            ], dtype=np.float32))
 
     def test_coverage_crop_handles_empty_and_invalid_pixels(self) -> None:
         for coverage in (np.zeros((2, 3)), np.empty((0, 0)), np.full((2, 3), np.nan)):
@@ -403,6 +967,273 @@ class SirilMosaicTests(unittest.TestCase):
         self.assertEqual(sirilmosaic.auto_crop_coverage_percent, 85)
         sirilmosaic.coverage_map_enabled = False
         sirilmosaic.auto_crop_enabled = False
+
+    def test_export_per_cohort_option_partitions_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.fit"
+            second = root / "second.fit"
+            third = root / "third.fit"
+            base = [
+                "SIMPLE  =                    T", "BITPIX  =                   16",
+                "NAXIS   =                    2", "NAXIS1  =                 3008",
+                "NAXIS2  =                 3008", "EXPTIME =                  20.0",
+                "GAIN    =                  80.0", "FILTER  = 'HaOIII  '",
+                "INSTRUME= 'Seestar S50      '", "END",
+            ]
+            for path in (first, second, third):
+                path.write_bytes(b"".join(card.ljust(80).encode("ascii") for card in base).ljust(2880, b" "))
+            changed = base.copy()
+            changed[5] = "EXPTIME =                  60.0"
+            third.write_bytes(b"".join(card.ljust(80).encode("ascii") for card in changed).ljust(2880, b" "))
+
+            partitions = sirilmosaic.partition_frame_cohorts([first, second, third])
+
+            self.assertEqual([len(files) for _, files in partitions], [2, 1])
+            self.assertIn("exposure_seconds=20", partitions[0][0])
+            self.assertIn("exposure_seconds=60", partitions[1][0])
+            tag = sirilmosaic.cohort_filename_tag(partitions[1][1][0])
+            self.assertEqual(
+                tag,
+                "camera-Seestar_S50_exp-60s_gain-80_filter-HaOIII_size-3008x3008",
+            )
+
+    def test_export_per_cohort_allows_coverage(self) -> None:
+        arguments = sirilmosaic.build_parser().parse_args([
+            "--export-per-cohort", "--coverage-map", "--auto-crop-master",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=2)
+            arguments.workdir = workdir
+            arguments.siril_exe = executable
+            arguments.output_dir = workdir / "output"
+            sirilmosaic.configure(arguments)
+            sirilmosaic.validate_parameters()
+            self.assertTrue(sirilmosaic.coverage_map_enabled)
+            self.assertTrue(sirilmosaic.auto_crop_enabled)
+
+    def test_export_per_cohort_resets_substack_completion_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / "workdir"
+            output = root / "output"
+            workdir.mkdir()
+            output.mkdir()
+            first = workdir / "first.fit"
+            second = workdir / "second.fit"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            executable = root / "siril.exe"
+            executable.touch()
+            arguments = sirilmosaic.build_parser().parse_args([
+                "--workdir", str(workdir),
+                "--output-dir", str(output),
+                "--siril-exe", str(executable),
+                "--export-per-cohort",
+                "--substacks", "1",
+            ])
+            calls = []
+
+            def fake_substack(number):
+                calls.append((number, sirilmosaic.active_cohort_id))
+                return True
+
+            def fake_masterstack(_number):
+                sirilmosaic.quality_report["master"] = {"path": str(output / "master.fit")}
+
+            def fake_cleanup(_number):
+                sirilmosaic.remove_tree(workdir / "Lights_sorted")
+
+            fake_siril = Mock()
+            with patch.multiple(
+                sirilmosaic,
+                discover_light_files=Mock(return_value=[first, second]),
+                partition_frame_cohorts=Mock(return_value=[
+                    ("cohort-a", [first]),
+                    ("cohort-b", [second]),
+                ]),
+                group_files=Mock(),
+                read_group_manifests=Mock(return_value={1: {}}),
+                substack=fake_substack,
+                masterstack=fake_masterstack,
+                cleanup=fake_cleanup,
+                final_cleanup=Mock(),
+                finalize_integration_report=Mock(),
+                write_verification_artifact=Mock(return_value=(output / "verification.json", {"status": "PASS"})),
+                write_quality_report=Mock(),
+                append_journal_event=Mock(),
+                debayer_preflight_warnings=Mock(return_value=[]),
+                open_siril_with_recovery=Mock(),
+                execute_siril=Mock(),
+                acquire_run_lock=Mock(),
+                release_run_lock=Mock(),
+                restore_rejected_frames=Mock(return_value=[]),
+                move_frame_selection_rejects=Mock(return_value=[]),
+                check_runtime_disk_headroom=Mock(),
+            ), patch("pysiril.siril.Siril", return_value=fake_siril):
+                result = sirilmosaic.run_pipeline(arguments)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(calls, [(1, "cohort-a"), (1, "cohort-b")])
+
+    def test_parser_accepts_supported_drizzle_and_rejection_methods(self) -> None:
+        parser = sirilmosaic.build_parser()
+        self.assertTrue(parser.parse_args(["--dry-run"]).dry_run)
+        analysis_arguments = parser.parse_args([
+            "--replay-ledger", "ledger.jsonl", "--integrity-scan",
+            "--integrity-scan-json", "scan.json",
+        ])
+        self.assertEqual(analysis_arguments.replay_ledger, Path("ledger.jsonl"))
+        self.assertTrue(analysis_arguments.integrity_scan)
+        self.assertEqual(analysis_arguments.integrity_scan_json, Path("scan.json"))
+        for kernel in sirilmosaic.DRIZZLE_KERNELS:
+            arguments = parser.parse_args(["--drizzle-kernel", kernel])
+            self.assertEqual(arguments.drizzle_kernel, kernel)
+        for method in sirilmosaic.PIXEL_REJECTION_METHODS:
+            arguments = parser.parse_args(["--rejection-method", method])
+            self.assertEqual(arguments.rejection_method, method)
+        for method in sirilmosaic.STACK_NORMALIZATION_METHODS:
+            arguments = parser.parse_args(["--stack-normalization", method])
+            self.assertEqual(arguments.stack_normalization, method)
+        arguments = parser.parse_args([
+            "--plate-solve-order", "5",
+            "--plate-solve-downscale",
+            "--plate-solve-radius", "2.5",
+            "--plate-solve-limit-mag", "+1",
+            "--rbf-smoothing", "0.75",
+            "--no-background-dither",
+            "--registration-transform", "similarity",
+            "--registration-minpairs", "8",
+            "--registration-maxstars", "500",
+            "--registration-interpolation", "cubic",
+            "--seed", "12345",
+        ])
+        self.assertEqual(arguments.plate_solve_order, 5)
+        self.assertTrue(arguments.plate_solve_downscale)
+        self.assertEqual(arguments.plate_solve_radius, 2.5)
+        self.assertEqual(arguments.plate_solve_limit_mag, "+1")
+        self.assertEqual(arguments.rbf_smoothing, "0.75")
+        self.assertFalse(arguments.background_dither)
+        self.assertEqual(arguments.registration_transform, "similarity")
+        self.assertEqual(arguments.registration_minpairs, 8)
+        self.assertEqual(arguments.registration_maxstars, 500)
+        self.assertEqual(arguments.registration_interpolation, "cubic")
+        self.assertEqual(arguments.seed, 12345)
+
+    def test_dry_run_validates_without_starting_siril_or_moving_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=3)
+            sources = {
+                path.relative_to(workdir): path.read_bytes()
+                for path in sirilmosaic.discover_light_files(workdir)
+            }
+            arguments = sirilmosaic.build_parser().parse_args([
+                "--workdir", str(workdir),
+                "--output-dir", str(Path(directory) / "output"),
+                "--siril-exe", str(executable),
+                "--dry-run", "--seed", "12345",
+            ])
+
+            with patch("pysiril.siril.Siril") as siril_class:
+                result = sirilmosaic.run_pipeline(arguments)
+
+            self.assertEqual(result, 0)
+            siril_class.assert_not_called()
+            self.assertEqual(
+                {
+                    path.relative_to(workdir): path.read_bytes()
+                    for path in sirilmosaic.discover_light_files(workdir)
+                },
+                sources,
+            )
+            self.assertFalse((workdir / "Lights_sorted").exists())
+            self.assertFalse((workdir / "rejects").exists())
+
+    def test_dry_run_counts_pending_rejects_without_restoring_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=4)
+            relative_path = Path("panel_1") / "lights" / "light.fit"
+            source = workdir / relative_path
+            rejects_path = workdir / "rejects" / relative_path
+            rejects_path.parent.mkdir(parents=True)
+            shutil.move(str(source), str(rejects_path))
+            arguments = sirilmosaic.build_parser().parse_args([
+                "--workdir", str(workdir),
+                "--output-dir", str(Path(directory) / "output"),
+                "--siril-exe", str(executable),
+                "--dry-run", "--test-frame-count", "4", "--seed", "12345",
+            ])
+
+            with patch("pysiril.siril.Siril") as siril_class, patch("builtins.print") as print_mock:
+                result = sirilmosaic.run_pipeline(arguments)
+
+            self.assertEqual(result, 0)
+            siril_class.assert_not_called()
+            output = "\n".join(
+                " ".join(str(argument) for argument in call.args)
+                for call in print_mock.call_args_list
+            )
+            self.assertIn(
+                "[DRY RUN] Input frames: 4 (3 current + 1 prior rejects to restore)",
+                output,
+            )
+            self.assertFalse(source.exists())
+            self.assertTrue(rejects_path.is_file())
+            self.assertFalse((workdir / "Lights_sorted").exists())
+
+    def test_advanced_command_builders_use_selected_settings(self) -> None:
+        with patch.multiple(
+            sirilmosaic,
+            background_method="rbf",
+            background_samples=24,
+            background_tolerance="1.2",
+            rbf_smoothing="0.75",
+            background_dither=False,
+            plate_solve_order=5,
+            plate_solve_downscale=True,
+            plate_solve_radius=2.5,
+            plate_solve_limit_mag="+1",
+            registration_transform="similarity",
+            registration_minpairs=8,
+            registration_maxstars=500,
+            registration_interpolation="cubic",
+        ):
+            self.assertEqual(
+                sirilmosaic.build_background_command("pp_light"),
+                "seqsubsky pp_light -rbf -samples=24 -tolerance=1.2 -smooth=0.75 -nodither",
+            )
+            self.assertEqual(
+                sirilmosaic.build_plate_solve_command("bkg_pp_light", "gaia"),
+                "seqplatesolve bkg_pp_light -order=5 -nocrop -nocache -force "
+                "-catalog=gaia -downscale -radius=2.5 -limitmag=+1",
+            )
+            self.assertEqual(
+                sirilmosaic.build_master_registration_command(),
+                "register pp_light -2pass -transf=similarity -interp=cubic "
+                "-minpairs=8 -maxstars=500",
+            )
+
+    def test_advanced_sections_align_within_each_grid_row(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            root.update_idletasks()
+            sections = {
+                str(widget.cget("text")): widget
+                for widget in app.advanced_content.winfo_children()
+                if isinstance(widget, ttk.LabelFrame)
+            }
+            self.assertEqual(
+                sections["Plate solving"].winfo_height(),
+                sections["Reproducibility"].winfo_height(),
+            )
+            self.assertEqual(
+                sections["Background extraction"].winfo_height(),
+                sections["Registration"].winfo_height(),
+            )
+        finally:
+            root.destroy()
 
     def test_coverage_mismatch_is_nonfatal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -474,6 +1305,7 @@ class SirilMosaicTests(unittest.TestCase):
             patch.object(sirilmosaic, 'execute_siril') as execute,
             patch.object(sirilmosaic, '_read_fits_array', return_value=coverage),
             patch.object(sirilmosaic, '_read_fits_dimensions', return_value=(12, 9)),
+            patch.object(sirilmosaic, 'require_siril_artifact'),
         ):
             sirilmosaic.create_cropped_master()
 
@@ -499,6 +1331,7 @@ class SirilMosaicTests(unittest.TestCase):
             patch.object(sirilmosaic, 'execute_siril') as execute,
             patch.object(sirilmosaic, '_read_fits_array', return_value=seconds) as read,
             patch.object(sirilmosaic, '_read_fits_dimensions', return_value=(8, 6)),
+            patch.object(sirilmosaic, 'require_siril_artifact'),
         ):
             sirilmosaic.create_cropped_master()
         read.assert_called_once_with(Path('seconds.fit'))
@@ -704,6 +1537,319 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertEqual(report["status"], "complete")
             self.assertEqual(report["run_id"], "test_run")
 
+    def test_frame_ledger_records_all_frame_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "process"
+            process.mkdir()
+            first = root / "first.fit"
+            second = root / "second.fit"
+            self.write_fits_layer_header(first, 3, 60)
+            self.write_fits_layer_header(second, 3, 300)
+            for sequence in ("light", "pp_light", "bkg_pp_light"):
+                self.write_fits_layer_header(process / f"{sequence}_00001.fit", 3, 60)
+                self.write_fits_layer_header(process / f"{sequence}_00002.fit", 3, 300)
+            self.write_fits_layer_header(process / "r_bkg_pp_light_00001.fit", 3, 60)
+            sirilmosaic.cosmetic_correction = False
+            sirilmosaic.drizzle_enabled = False
+
+            report = sirilmosaic.summarize_substack_frames(
+                [first, second], process, "pp_light", "bkg_pp_light",
+                {"sequence_frames": 2, "quality_filters": {}},
+                {"stacked_frames": 1}, [],
+            )
+
+            self.assertEqual(len(report["frame_ledger_records"]), 2)
+            statuses = {record["file"]: record["status"] for record in report["frame_ledger_records"]}
+            self.assertEqual(statuses["first.fit"], "stacked")
+            self.assertEqual(statuses["second.fit"], "rejected")
+            self.assertIn("stages", report["frame_ledger_records"][0])
+
+    def test_frame_ledger_writer_appends_jsonl_and_updates_report_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sirilmosaic.output_dir = Path(directory)
+            sirilmosaic.run_id = "ledger_test"
+            sirilmosaic.frame_ledger_path = Path(directory) / "frame_ledger_ledger_test.jsonl"
+            sirilmosaic.quality_report = {}
+            sirilmosaic.journal_path = None
+
+            sirilmosaic.append_frame_ledger([
+                {"file": "first.fit", "status": "stacked"},
+                {"file": "second.fit", "status": "rejected"},
+            ])
+
+            records = [
+                json.loads(line)
+                for line in sirilmosaic.frame_ledger_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([record["file"] for record in records], ["first.fit", "second.fit"])
+            self.assertEqual(sirilmosaic.quality_report["frame_ledger_records"], 2)
+
+    def test_replay_frame_ledger_predicts_selected_frames_and_exposure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "frame_ledger.jsonl"
+            values = ((2, 0.90, 0.01, 100), (4, 0.80, 0.02, 200), (6, 0.70, 0.03, 300), (8, 0.60, 0.04, 400))
+            ledger.write_text("\n".join(json.dumps({
+                "file": f"frame_{index}.fit",
+                "status": "stacked" if index == 1 else "rejected",
+                "cohort": "panel_a" if index < 3 else "panel_b",
+                "exposure_seconds": 60,
+                "filter_metrics": {
+                    "fwhm": {"value": fwhm},
+                    "roundness": {"value": roundness},
+                    "background": {"value": background},
+                    "stars": {"value": stars},
+                },
+            }) for index, (fwhm, roundness, background, stars) in enumerate(values, 1)) + "\n", encoding="utf-8")
+
+            replay = sirilmosaic.replay_frame_ledger(ledger, {
+                "background": 75,
+                "roundness": 75,
+                "fwhm": 75,
+                "stars": 75,
+            })
+
+            self.assertEqual(replay["predicted"]["selected_frames"], 2)
+            self.assertEqual(replay["predicted"]["excluded_frames"], 2)
+            self.assertEqual(replay["predicted"]["integrated_exposure_seconds"], 120.0)
+            self.assertEqual(replay["cohorts"]["panel_a"]["selected"], 1)
+            self.assertEqual(replay["comparison"]["current_selected_frames"], 1)
+            self.assertEqual(replay["comparison"]["selected_frame_delta"], 1)
+            self.assertFalse(replay["coverage_impact"]["available"])
+
+    def test_checkpoint_inspection_validates_artifacts_and_requested_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / "frames"
+            output = root / "output"
+            workdir.mkdir()
+            output.mkdir()
+            manifest = output / "input_manifest.json"
+            report = output / "quality_report.json"
+            ledger = output / "frame_ledger.jsonl"
+            for path in (manifest, report, ledger):
+                path.write_text("{}", encoding="utf-8")
+            checkpoint = {
+                "schema_version": 1,
+                "state": "interrupted",
+                "workdir": str(workdir),
+                "output_dir": str(output),
+                "substack_count": 1,
+                "completed_substacks": [],
+                "groups": {"1": ["light.fit"]},
+                "input_manifest": str(manifest),
+                "quality_report": str(report),
+                "frame_ledger": str(ledger),
+            }
+            (output / sirilmosaic.RUN_CHECKPOINT).write_text(json.dumps(checkpoint), encoding="utf-8")
+
+            inspected = sirilmosaic.inspect_checkpoint(output, workdir)
+            self.assertEqual(inspected["status"], "AVAILABLE")
+            self.assertTrue(all(check["status"] != "FAIL" for check in inspected["checks"]))
+            mismatched = sirilmosaic.inspect_checkpoint(output / "other", workdir)
+            self.assertEqual(mismatched["status"], "NONE")
+
+    def test_cleanup_review_never_deletes_staged_source_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / "frames"
+            output = root / "output"
+            (workdir / "Lights_sorted" / "group_1" / "lights").mkdir(parents=True)
+            (workdir / "Lights_sorted" / "group_1" / "lights" / "frame.fit").write_bytes(b"source")
+            (workdir / "substacks").mkdir(parents=True)
+            output.mkdir()
+            temporary = output / "artifact.tmp"
+            temporary.write_text("temporary", encoding="utf-8")
+
+            candidates = sirilmosaic.stale_artifacts(workdir, output)
+            staged = next(item for item in candidates if item["path"].endswith("Lights_sorted"))
+            self.assertFalse(staged["safe_to_delete"])
+            with self.assertRaises(ValueError):
+                sirilmosaic.delete_stale_artifacts(workdir, output, [staged["path"]])
+            sirilmosaic.delete_stale_artifacts(workdir, output, [str(temporary)])
+            self.assertFalse(temporary.exists())
+            self.assertTrue((workdir / "Lights_sorted" / "group_1" / "lights" / "frame.fit").exists())
+
+    def test_run_lock_is_exclusive_and_owner_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            output.mkdir()
+            sirilmosaic.output_dir = output
+            sirilmosaic.workdir = Path(directory) / "frames"
+            sirilmosaic.run_id = "lock_test"
+
+            lock_path = sirilmosaic.acquire_run_lock()
+            self.assertTrue(lock_path.is_file())
+            self.assertEqual(sirilmosaic.inspect_run_lock(output)["status"], "AVAILABLE")
+            with self.assertRaisesRegex(RuntimeError, "Another run owns"):
+                sirilmosaic.acquire_run_lock()
+            sirilmosaic.release_run_lock()
+            self.assertEqual(sirilmosaic.inspect_run_lock(output)["status"], "NONE")
+
+    def test_integrity_scan_reports_exact_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "frame_01.fit"
+            duplicate = root / "frame_02.fit"
+            self.write_fits_layer_header(first, 1, 60)
+            shutil.copy2(first, duplicate)
+
+            scan = sirilmosaic.scan_input_integrity(
+                root,
+                root / "output",
+                files=[first, duplicate],
+                bayer_pattern="auto",
+                orientation="top-down",
+                drizzle=False,
+            )
+
+            self.assertEqual(scan["status"], "WARN")
+            duplicate_check = next(item for item in scan["checks"] if item["name"] == "duplicates")
+            self.assertEqual(duplicate_check["status"], "WARN")
+            self.assertEqual(len(duplicate_check["groups"]), 1)
+
+    def test_integrity_scan_reuses_cache_until_input_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            first = root / "frame_01.fit"
+            self.write_fits_layer_header(first, 1, 60)
+
+            initial = sirilmosaic.scan_input_integrity(root, output, files=[first])
+            cached = sirilmosaic.scan_input_integrity(root, output, files=[first])
+            self.assertFalse(initial["cached"])
+            self.assertTrue(cached["cached"])
+            self.assertTrue((output / "integrity_scan_cache.json").is_file())
+
+            first.write_bytes(first.read_bytes() + b"changed")
+            refreshed = sirilmosaic.scan_input_integrity(root, output, files=[first])
+            self.assertFalse(refreshed["cached"])
+
+    def test_deep_integrity_scan_rejects_truncated_fits_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            frame = root / "frame.fit"
+            self.write_fits_layer_header(frame, 1, 60)
+
+            scan = sirilmosaic.scan_input_integrity(root, output, files=[frame], deep_payload=True)
+
+            self.assertEqual(scan["status"], "FAIL")
+            payload_check = next(item for item in scan["checks"] if item["name"] == "deep_payload")
+            self.assertEqual(payload_check["status"], "FAIL")
+
+    def test_runtime_disk_headroom_guard_aborts_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sirilmosaic.workdir = Path(directory) / "frames"
+            sirilmosaic.output_dir = Path(directory) / "output"
+            sirilmosaic.minimum_free_disk_gb = 0.5
+            disk_usage = shutil.disk_usage(Path(directory))
+            low_space = type(disk_usage)(disk_usage.total, disk_usage.used, 100)
+            with patch.object(sirilmosaic.shutil, 'disk_usage', return_value=low_space):
+                with self.assertRaisesRegex(RuntimeError, 'disk headroom'):
+                    sirilmosaic.check_runtime_disk_headroom()
+
+    def _write_verifiable_run(self, root: Path) -> Path:
+        workdir = root / "frames"
+        output = root / "output"
+        rejects = workdir / "rejects"
+        workdir.mkdir()
+        output.mkdir()
+        rejects.mkdir()
+        for name in ("light_01.fit", "light_02.fit"):
+            (workdir / name).write_bytes(b"synthetic light")
+        master = output / "master_stack_verify.fit"
+        integration = output / "integration_time_map_verify.fit"
+        cropped = output / "master_stack_verify_cropped.fit"
+        for path, shape in ((master, (6, 8)), (integration, (6, 8)), (cropped, (4, 5))):
+            sirilmosaic._write_coverage_fits(
+                path,
+                np.ones(shape, dtype=np.float32),
+                unit="s",
+            )
+        manifest_path = output / "input_manifest_verify.json"
+        manifest_path.write_text(json.dumps({
+            "selected_files": [
+                {"path": "light_01.fit"},
+                {"path": "light_02.fit"},
+            ],
+        }), encoding="utf-8")
+        journal_path = output / "run_events_verify.jsonl"
+        journal_path.write_text(
+            json.dumps({"sequence": 1, "event": "run_started"}) + "\n"
+            + json.dumps({"sequence": 2, "event": "run_finished", "status": "complete"}) + "\n",
+            encoding="utf-8",
+        )
+        ledger_path = output / "frame_ledger_verify.jsonl"
+        ledger_path.write_text(
+            json.dumps({"file": "light_01.fit", "status": "stacked"}) + "\n"
+            + json.dumps({"file": "light_02.fit", "status": "stacked"}) + "\n",
+            encoding="utf-8",
+        )
+        report_path = output / "quality_report_verify.json"
+        report_path.write_text(json.dumps({
+            "report_schema_version": 3,
+            "run_id": "verify",
+            "status": "complete",
+            "input_frames": 2,
+            "settings": {
+                "auto_crop_master": True,
+                "rejects_directory": str(rejects),
+            },
+            "input_manifest": str(manifest_path),
+            "journal_path": str(journal_path),
+            "frame_ledger_path": str(ledger_path),
+            "master": {"path": str(master)},
+            "coverage": {
+                "integration_time_path": str(integration),
+                "cropped_master_path": str(cropped),
+            },
+            "rejected_files": [],
+            "substacks": [{
+                "input_frames": 2,
+                "accepted_frames": 2,
+                "rejected_frames": 0,
+                "stack": {"stacked_frames": 2},
+            }],
+        }), encoding="utf-8")
+        return report_path
+
+    def test_verify_run_passes_consistent_completed_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            verification = sirilmosaic.verify_run(self._write_verifiable_run(Path(directory)))
+
+            self.assertEqual(verification["status"], "PASS")
+            self.assertEqual(verification["counts"]["FAIL"], 0)
+            self.assertGreaterEqual(verification["counts"]["PASS"], 8)
+
+    def test_verify_run_fails_missing_required_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = self._write_verifiable_run(Path(directory))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            Path(report["master"]["path"]).unlink()
+
+            verification = sirilmosaic.verify_run(report_path)
+
+            self.assertEqual(verification["status"], "FAIL")
+            self.assertTrue(any(check["name"] == "master_artifact" for check in verification["checks"]))
+
+    def test_verification_artifact_and_run_bundle_include_current_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = self._write_verifiable_run(Path(directory))
+            verification_path, verification = sirilmosaic.write_verification_artifact(report_path)
+            bundle_path = sirilmosaic.create_run_bundle(report_path)
+
+            self.assertEqual(verification["status"], "PASS")
+            self.assertTrue(verification_path.is_file())
+            with zipfile.ZipFile(bundle_path) as bundle:
+                names = set(bundle.namelist())
+            self.assertIn(report_path.name, names)
+            self.assertIn(verification_path.name, names)
+            self.assertIn("frame_ledger_verify.jsonl", names)
+            self.assertIn("configuration_verify.json", names)
+
     def test_integration_report_sums_exact_stacked_exposure(self) -> None:
         sirilmosaic.quality_report = {
             "substacks": [{
@@ -761,6 +1907,14 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertEqual(report["discarded_frames"][0]["exposure_seconds"], 300.0)
             self.assertEqual(report["discarded_frames"][0]["reason_code"], "registration_excluded")
             self.assertEqual(report["discarded_frames"][0]["candidate_filters"], ["fwhm"])
+            self.assertEqual(report["discarded_frames"][0]["filter_metrics"], {
+                "fwhm": {
+                    "value": None,
+                    "threshold": None,
+                    "comparison": "unavailable",
+                    "status": "unavailable",
+                }
+            })
             self.assertEqual(report["stage_exposure_seconds"]["stacked"], 60)
 
             unknown = sirilmosaic.summarize_substack_frames(
@@ -778,6 +1932,67 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertEqual(missing['stage_missing_exposure_frames']['registered'], 1)
             self.assertIsNone(missing['stage_exposure_seconds']['stacked'])
 
+    def test_discarded_frame_report_includes_siril_filter_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "process"
+            process.mkdir()
+            first = root / "first.fit"
+            second = root / "second.fit"
+            self.write_fits_layer_header(first, 3, 60)
+            self.write_fits_layer_header(second, 3, 300)
+            sirilmosaic.cosmetic_correction = False
+            sirilmosaic.drizzle_enabled = False
+            for sequence in ("light", "pp_light", "bkg_pp_light"):
+                self.write_fits_layer_header(process / f"{sequence}_00001.fit", 3, 60)
+                self.write_fits_layer_header(process / f"{sequence}_00002.fit", 3, 300)
+            self.write_fits_layer_header(process / "r_bkg_pp_light_00001.fit", 3, 60)
+            (process / "bkg_pp_light_.seq").write_text(
+                "S 'bkg_pp_light_' 1 2 2 5 -1 6 0 0 0\n"
+                "L 3\n"
+                "I 1 1\nI 2 1\n"
+                "R1 8.2 8.5 0.42 1.0 0.12 123 H 1 0 0 0 1 0 0 0 1\n"
+                "R1 4.1 4.2 0.91 1.0 0.02 456 H 1 0 0 0 1 0 0 0 1\n",
+                encoding="utf-8",
+            )
+
+            report = sirilmosaic.summarize_substack_frames(
+                [first, second],
+                process,
+                "pp_light",
+                "bkg_pp_light",
+                {
+                    "sequence_frames": 2,
+                    "quality_filters": {
+                        "fwhm": {"threshold": 6.0, "passing_frames": 1},
+                        "roundness": {"threshold": 0.6, "passing_frames": 2},
+                        "background": {"threshold": 0.01, "passing_frames": 1},
+                        "stars": {"threshold": 500, "passing_frames": 1},
+                    },
+                },
+                {"stacked_frames": 1},
+                [],
+            )
+
+            discarded = report["discarded_frames"][0]
+            self.assertEqual(discarded["filter_metrics"]["fwhm"], {
+                "value": 4.1,
+                "threshold": 6.0,
+                "comparison": "<=",
+                "status": "passed",
+            })
+            self.assertEqual(discarded["filter_metrics"]["roundness"], {
+                "value": 0.91,
+                "threshold": 0.6,
+                "comparison": ">=",
+                "status": "passed",
+            })
+            self.assertEqual(
+                discarded["reason"],
+                "Excluded during registration; see filter_metrics for measured values",
+            )
+            self.assertEqual(discarded["filter_metric_source"], "Siril sequence registration data")
+
     def test_failed_command_telemetry_is_written_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sirilmosaic.output_dir = Path(directory)
@@ -792,6 +2007,150 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertEqual(report['commands'][0]['status'], 'failed')
             self.assertGreaterEqual(report['commands'][0]['seconds'], 0)
             self.assertFalse(sirilmosaic.quality_report_path().with_suffix('.tmp').exists())
+
+    def test_siril_watchdog_times_out_and_marks_pipe_unresponsive(self) -> None:
+        class SlowSiril(FakeSiril):
+            def Execute(self, command: str) -> bool:
+                time.sleep(0.05)
+                return super().Execute(command)
+
+        sirilmosaic.app = SlowSiril()
+        sirilmosaic.siril_command_timeout = 0.001
+        with patch.object(sirilmosaic, 'terminate_siril_processes', return_value=0) as terminate:
+            with self.assertRaisesRegex(sirilmosaic.SirilCommandError, 'timed out'):
+                sirilmosaic.execute_siril('set32bits')
+        terminate.assert_called_once_with()
+        self.assertTrue(sirilmosaic.siril_unresponsive)
+
+    def test_siril_open_recovers_once_from_pipe_failure(self) -> None:
+        first = Mock()
+        first.Open.side_effect = RuntimeError('broken pipe: all pipe instances are busy')
+        second = Mock()
+        second.Open.return_value = True
+        factory = Mock(side_effect=[second])
+        sirilmosaic.app = first
+        sirilmosaic.siril_open_timeout = 0
+        with patch.object(sirilmosaic, 'terminate_siril_processes', return_value=1) as current_cleanup, patch.object(
+            sirilmosaic, 'terminate_stale_run_processes', return_value=3
+        ) as stale_cleanup:
+            sirilmosaic.open_siril_with_recovery(factory)
+
+        current_cleanup.assert_called_once_with()
+        stale_cleanup.assert_called_once_with(sirilmosaic.workdir, sirilmosaic.output_dir)
+        factory.assert_called_once()
+        self.assertIs(sirilmosaic.app, second)
+
+    def test_successful_command_and_manifest_are_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir, _ = self.make_project(root, light_count=2)
+            sirilmosaic.workdir = workdir
+            sirilmosaic.output_dir = root / "output"
+            sirilmosaic.output_dir.mkdir()
+            sirilmosaic.run_id = "journal_test"
+            sirilmosaic.run_seed = 12345
+            sirilmosaic.journal_path = sirilmosaic.output_dir / "events.jsonl"
+            sirilmosaic.quality_report = {'run_id': sirilmosaic.run_id, 'active_substack': 2}
+            sirilmosaic.app = FakeSiril()
+
+            sirilmosaic.execute_siril("set32bits")
+            manifest_path = sirilmosaic.write_input_manifest(
+                sirilmosaic.discover_light_files(workdir),
+                [(None, sirilmosaic.discover_light_files(workdir))],
+            )
+
+            command = sirilmosaic.quality_report['commands'][0]
+            self.assertEqual(command['status'], 'complete')
+            self.assertEqual(command['substack'], 2)
+            self.assertTrue(command['response_tail'])
+            events = [json.loads(line) for line in sirilmosaic.journal_path.read_text().splitlines()]
+            self.assertEqual(events[0]['event'], 'siril_command')
+            self.assertEqual(events[0]['response_tail'], command['response_tail'])
+            manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest['seed'], 12345)
+            self.assertEqual(len(manifest['selected_files']), 2)
+            self.assertEqual(len(manifest['cohorts'][0]['files']), 2)
+            self.assertTrue(all('sha256' in entry for entry in manifest['selected_files']))
+
+    def test_resume_input_identity_rejects_changed_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / 'frames'
+            output = root / 'output'
+            workdir.mkdir()
+            output.mkdir()
+            frame = workdir / 'light.fit'
+            frame.write_bytes(b'original')
+            sirilmosaic.workdir = workdir
+            sirilmosaic.output_dir = output
+            sirilmosaic.run_id = 'identity_test'
+            sirilmosaic.run_seed = 123
+            manifest = sirilmosaic.write_input_manifest([frame], [(None, [frame])])
+            checkpoint = {
+                'input_manifest': str(manifest),
+                'selected_files': ['light.fit'],
+                'input_frames': 1,
+            }
+            frame.write_bytes(b'changed!')
+
+            with self.assertRaisesRegex(RuntimeError, 'changed'):
+                sirilmosaic.validate_resume_input_identity(checkpoint)
+
+    def test_resume_input_identity_accepts_frame_left_in_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / 'frames'
+            output = root / 'output'
+            workdir.mkdir()
+            output.mkdir()
+            source = workdir / 'light.fit'
+            self.write_fits_layer_header(source, 1, 60)
+            sirilmosaic.workdir = workdir
+            sirilmosaic.output_dir = output
+            sirilmosaic.run_id = 'staged_identity_test'
+            sirilmosaic.run_seed = 123
+            manifest_path = sirilmosaic.write_input_manifest([source], [(None, [source])])
+            staged_lights = workdir / 'Lights_sorted' / 'group_1' / 'lights'
+            staged_lights.mkdir(parents=True)
+            (staged_lights.parent / sirilmosaic.SOURCE_MANIFEST).write_text(
+                json.dumps({'frame_00001.fit': 'light.fit'}), encoding='utf-8'
+            )
+            source.rename(staged_lights / 'frame_00001.fit')
+            checkpoint = {
+                'input_manifest': str(manifest_path),
+                'selected_files': ['light.fit'],
+                'input_frames': 1,
+            }
+
+            paths, _manifest, identity = sirilmosaic.validate_resume_input_identity(checkpoint)
+
+            self.assertEqual(paths, [workdir / 'light.fit'])
+            self.assertEqual(identity['staged_files'], ['light.fit'])
+
+    @unittest.skipUnless(os.environ.get('SIRIL_TEST_CLI'), 'Set SIRIL_TEST_CLI for Siril command contract test')
+    def test_real_siril_accepts_advanced_command_families(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / 'advanced_help.ssf'
+            script.write_text(
+                'requires 1.3.6\n'
+                'help seqsubsky\n'
+                'help seqplatesolve\n'
+                'help register\n',
+                encoding='utf-8',
+            )
+            result = subprocess.run(
+                [os.environ['SIRIL_TEST_CLI'], '-s', str(script)],
+                cwd=directory,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=90,
+            )
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output[-6000:])
+            for token in ('-smooth=', '-downscale', '-radius=', '-transf=', '-minpairs='):
+                self.assertIn(token, output)
 
     def test_unknown_integration_is_not_proportional_estimate(self) -> None:
         sirilmosaic.quality_report = {'substacks': [{'stack': {'stacked_frames': 1}}]}
@@ -873,6 +2232,7 @@ class SirilMosaicTests(unittest.TestCase):
                 app.substacks.set(3)
                 app.auto_substacks.set(True)
                 app.drizzle_scale.set(1.5)
+                app.drizzle_kernel.set("square")
                 app.filter_background.set(94)
                 app.debug.set(True)
                 app.drizzle.set(False)
@@ -882,6 +2242,18 @@ class SirilMosaicTests(unittest.TestCase):
                 app.cosmetic_cold_sigma.set(4.2)
                 app.cosmetic_hot_sigma.set(3.4)
                 app.overlap_normalization.set(False)
+                app.stack_normalization.set("mulscale")
+                app.plate_solve_order.set(5)
+                app.plate_solve_downscale.set(True)
+                app.plate_solve_radius.set("2.5")
+                app.plate_solve_limit_mag.set("+1")
+                app.rbf_smoothing.set(0.75)
+                app.background_dither.set(False)
+                app.registration_transform.set("similarity")
+                app.registration_minpairs.set(8)
+                app.registration_maxstars.set(500)
+                app.registration_interpolation.set("cubic")
+                app.random_seed.set("12345")
                 app.adaptive_quality_filtering.set(True)
                 app.quality_filter_sigma.set(2.8)
                 app.background_method.set("RBF")
@@ -889,6 +2261,10 @@ class SirilMosaicTests(unittest.TestCase):
                 app.background_tolerance.set(1.3)
                 app.fast_normalization.set(True)
                 app.skip_failed_frames.set(True)
+                app.export_per_cohort.set(True)
+                app.coverage_map.set(True)
+                app.auto_crop_master.set(True)
+                app.rejection_method.set("winsorized")
 
                 command = app.command()
                 arguments = sirilmosaic.build_parser().parse_args(command[3:])
@@ -899,6 +2275,7 @@ class SirilMosaicTests(unittest.TestCase):
                 self.assertEqual(arguments.substacks, 3)
                 self.assertTrue(arguments.auto_substacks)
                 self.assertEqual(arguments.drizzle_scale, "1.5")
+                self.assertEqual(arguments.drizzle_kernel, "square")
                 self.assertNotIn('--filter-background', command)
                 self.assertEqual(arguments.bayer_pattern, "GRBG")
                 self.assertEqual(arguments.bayer_orientation, "bottom-up")
@@ -906,15 +2283,31 @@ class SirilMosaicTests(unittest.TestCase):
                 self.assertEqual(arguments.cosmetic_cold_sigma, "4.2")
                 self.assertEqual(arguments.cosmetic_hot_sigma, "3.4")
                 self.assertFalse(arguments.overlap_normalization)
+                self.assertEqual(arguments.stack_normalization, "mulscale")
+                self.assertEqual(arguments.plate_solve_order, 5)
+                self.assertTrue(arguments.plate_solve_downscale)
+                self.assertEqual(arguments.plate_solve_radius, 2.5)
+                self.assertEqual(arguments.plate_solve_limit_mag, "+1")
+                self.assertEqual(arguments.rbf_smoothing, "0.75")
+                self.assertFalse(arguments.background_dither)
+                self.assertEqual(arguments.registration_transform, "similarity")
+                self.assertEqual(arguments.registration_minpairs, 8)
+                self.assertEqual(arguments.registration_maxstars, 500)
+                self.assertEqual(arguments.registration_interpolation, "cubic")
+                self.assertEqual(arguments.seed, 12345)
                 self.assertTrue(arguments.adaptive_quality_filtering)
                 self.assertEqual(arguments.quality_filter_sigma, 2.8)
                 self.assertEqual(arguments.background_method, "rbf")
                 self.assertEqual(arguments.background_samples, 30)
                 self.assertEqual(arguments.background_tolerance, 1.3)
-                self.assertTrue(arguments.fast_normalization)
+                self.assertFalse(arguments.fast_normalization)
                 self.assertTrue(arguments.skip_failed_frames)
                 self.assertTrue(arguments.debug)
                 self.assertFalse(arguments.drizzle)
+                self.assertTrue(arguments.export_per_cohort)
+                self.assertTrue(arguments.coverage_map)
+                self.assertTrue(arguments.auto_crop_master)
+                self.assertEqual(arguments.rejection_method, "winsorized")
             finally:
                 root.destroy()
 
@@ -981,24 +2374,274 @@ class SirilMosaicTests(unittest.TestCase):
         root = self.gui_root()
         root.withdraw()
         try:
-            SirilMosaicApp(root)
+            app = SirilMosaicApp(root)
             groups = {
-                child.cget("text")
-                for container in root.winfo_children()
-                for child in container.winfo_children()
-                if isinstance(child, ttk.LabelFrame)
+                section.cget("text")
+                for column in app.settings_content.winfo_children()
+                for section in column.winfo_children()
+                if isinstance(section, ttk.LabelFrame)
             }
 
             self.assertTrue({
                 "Capture & CFA",
                 "Cosmetic correction",
+                "Drizzle Settings",
                 "Frame selection",
                 "Integration",
                 "Background & plate solving",
                 "Resources",
             }.issubset(groups))
+            section_rows = {
+                section.cget("text"): int(section.grid_info()["row"])
+                for column in app.settings_content.winfo_children()
+                for section in column.winfo_children()
+                if isinstance(section, ttk.LabelFrame)
+            }
+            self.assertEqual(section_rows["Drizzle Settings"], 1)
+            self.assertEqual(section_rows["Integration"], 2)
         finally:
             root.destroy()
+
+    def test_gui_run_review_shows_discard_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "quality_report_test.json"
+            report_path.write_text(json.dumps({
+                "status": "complete",
+                "run_id": "review_test",
+                "input_frames": 10,
+                "seed": 123,
+                "configuration_hash": "abc123",
+                "journal_path": "events.jsonl",
+                "input_manifest": "manifest.json",
+                "settings": {},
+                "cohorts": [],
+                "substacks": [{
+                    "number": 1,
+                    "stack": {"stacked_frames": 9},
+                    "discarded_frames": [{
+                        "file": "panel/light_01.fit",
+                        "status": "rejected",
+                        "reason_code": "registration_excluded",
+                        "filter_metrics": {
+                            "fwhm": {
+                                "value": 8.2,
+                                "threshold": 6.0,
+                                "comparison": "<=",
+                                "status": "failed",
+                            }
+                        },
+                    }],
+                }],
+            }), encoding="utf-8")
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.refresh_run_review(report_path)
+                values = app.review_tree.item(app.review_tree.get_children()[0], "values")
+                self.assertEqual(values[1], "panel/light_01.fit")
+                self.assertEqual(
+                    tuple(app.review_tree["columns"]),
+                    ("substack", "file", "status", "reason", "fwhm", "roundness", "background", "stars"),
+                )
+                self.assertEqual(values[4], "8.200 <= 6.000 [failed]")
+                self.assertEqual(values[5], "-")
+                summary = app.review_summary.get("1.0", "end")
+                self.assertIn("Stacked frames: 9", summary)
+                self.assertIn("Rejected: 1", summary)
+            finally:
+                root.destroy()
+
+    def test_gui_run_review_verifies_loaded_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = self._write_verifiable_run(Path(directory))
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.refresh_run_review(report_path)
+                app.verify_loaded_run()
+                self.assertTrue(app.verification_status.get().startswith("PASS"))
+                dialogs = [child for child in root.winfo_children() if isinstance(child, tk.Toplevel)]
+                for dialog in dialogs:
+                    dialog.destroy()
+            finally:
+                root.destroy()
+
+    def test_gui_preview_counts_pending_rejects_in_total(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=4)
+            rejected_source = workdir / "panel_1" / "lights" / "light.fit"
+            rejected_path = workdir / "rejects" / "panel_1" / "lights" / "light.fit"
+            rejected_path.parent.mkdir(parents=True)
+            shutil.move(str(rejected_source), str(rejected_path))
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.workdir.set(str(workdir))
+                app.output_dir.set(str(Path(directory) / "output"))
+                app.siril_exe.set(str(executable))
+                summary = app._preflight_summary(workdir, Path(directory) / "output")
+                self.assertIn("Frames: 4 (3 current + 1 prior rejects to restore)", summary)
+                self.assertIn("Frames this run: 4", summary)
+                self.assertIsInstance(app.command(), list)
+            finally:
+                root.destroy()
+
+    def test_gui_preview_run_includes_integrity_scan_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=2)
+            output_dir = Path(directory) / "output"
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.workdir.set(str(workdir))
+                app.output_dir.set(str(output_dir))
+                app.siril_exe.set(str(executable))
+                callbacks = []
+
+                def capture_scan(callback):
+                    callbacks.append(callback)
+
+                with patch.object(app, "_start_integrity_scan", side_effect=capture_scan):
+                    app.preview_run()
+
+                self.assertEqual(len(callbacks), 1)
+                callbacks[0]({
+                    "status": "WARN",
+                    "counts": {"PASS": 6, "WARN": 1, "FAIL": 0},
+                    "checks": [{"status": "WARN", "name": "duplicates", "detail": "one group"}],
+                })
+                dialogs = [child for child in root.winfo_children() if isinstance(child, tk.Toplevel)]
+                self.assertTrue(dialogs)
+                preview_text = dialogs[-1].winfo_children()[0]
+                self.assertIn("Preflight integrity scan: WARN", preview_text.get("1.0", "end"))
+                for dialog in dialogs:
+                    dialog.destroy()
+            finally:
+                root.destroy()
+
+    def test_gui_resume_run_dispatches_resume_mode_when_checkpoint_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.output_dir.set(directory)
+                (Path(directory) / 'run_checkpoint.json').write_text('{}', encoding='utf-8')
+                with patch.object(app, 'start') as start:
+                    app.resume_run()
+                    start.assert_called_once_with(resume=True)
+            finally:
+                root.destroy()
+
+    def test_gui_cropping_workbench_loads_report_and_previews_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root_path = Path(directory)
+            master = root_path / "master_stack_run.fit"
+            integration = root_path / "integration_time_map_run.fit"
+            report_path = root_path / "quality_report_run.json"
+            sirilmosaic._write_coverage_fits(
+                master,
+                np.linspace(1, 100, 100, dtype=np.float32).reshape(10, 10),
+                unit="adu",
+            )
+            coverage = np.zeros((10, 10), dtype=np.float32)
+            coverage[2:8, 1:9] = 10
+            sirilmosaic._write_coverage_fits(integration, coverage, unit="s")
+            report_path.write_text(json.dumps({
+                "status": "complete",
+                "master": {"path": str(master)},
+                "coverage": {"integration_time_path": str(integration)},
+            }), encoding="utf-8")
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.load_crop_report(report_path, notify=False)
+                self.assertEqual(len(app.crop_artifacts), 1)
+                deadline = time.time() + 5
+                while (
+                    (app.crop_plan is None or app.crop_preview_in_progress or app.crop_full_rgb is None)
+                    and time.time() < deadline
+                ):
+                    root.update()
+                    time.sleep(0.01)
+                self.assertEqual(app.crop_plan["crop_bounds"]["width"], 8)
+                self.assertIsNotNone(app.crop_region_rgb)
+                self.assertIn("Pixels retained: 48.000%", app.crop_summary.get("1.0", "end"))
+                app.set_crop_percent(75)
+                deadline = time.time() + 5
+                while (
+                    app.crop_plan is None
+                    or app.crop_plan["crop_coverage_percent"] != 75.0
+                    or app.crop_preview_in_progress
+                    or app.crop_full_rgb is None
+                ):
+                    if time.time() >= deadline:
+                        break
+                    root.update()
+                    time.sleep(0.01)
+                self.assertEqual(app.crop_plan["crop_coverage_percent"], 75.0)
+                self.assertIn("_crop_075pct.fit", app.crop_plan["output_path"])
+            finally:
+                root.destroy()
+
+    def test_gui_cropping_workbench_starts_create_after_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root_path = Path(directory)
+            master = root_path / "master_stack_run.fit"
+            integration = root_path / "integration_time_map_run.fit"
+            report_path = root_path / "quality_report_run.json"
+            executable = root_path / "siril.exe"
+            executable.touch()
+            sirilmosaic._write_coverage_fits(
+                master,
+                np.linspace(1, 100, 100, dtype=np.float32).reshape(10, 10),
+                unit="adu",
+            )
+            coverage = np.zeros((10, 10), dtype=np.float32)
+            coverage[2:8, 1:9] = 10
+            sirilmosaic._write_coverage_fits(integration, coverage, unit="s")
+            report_path.write_text(json.dumps({
+                "status": "complete",
+                "master": {"path": str(master)},
+                "coverage": {"integration_time_path": str(integration)},
+            }), encoding="utf-8")
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.siril_exe.set(str(executable))
+                app.load_crop_report(report_path, notify=False)
+                deadline = time.time() + 5
+                while app.crop_plan is None and time.time() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+                with patch.object(app, "_start_crop_operation") as start_crop:
+                    app.create_crop()
+                    start_crop.assert_called_once()
+                    command, output_path = start_crop.call_args.args
+                    self.assertIn("--crop-workbench", command)
+                    self.assertTrue(str(output_path).endswith("_crop_050pct.fit"))
+            finally:
+                root.destroy()
+
+    def test_gui_cropping_workbench_starts_background_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                output_path = Path(directory) / "cropped.fit"
+                with patch("sirilmosaic_gui.Thread") as thread_class:
+                    app._start_crop_operation(["crop-command"], output_path)
+                    thread_class.assert_called_once()
+                    thread_class.return_value.start.assert_called_once_with()
+            finally:
+                root.destroy()
 
     def test_gui_run_profiles_persist_processing_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1009,11 +2652,25 @@ class SirilMosaicTests(unittest.TestCase):
                 app = SirilMosaicApp(root, profile_path=profile_path)
                 app.profile_name.set("OSC drizzle")
                 app.drizzle_scale.set(1.7)
+                app.drizzle_kernel.set("gaussian")
+                app.rejection_method.set("winsorized")
                 app.bayer_pattern.set("RGGB")
                 app.cosmetic_correction.set(False)
                 app.cosmetic_cold_sigma.set(4.5)
                 app.cosmetic_hot_sigma.set(4.0)
                 app.overlap_normalization.set(False)
+                app.stack_normalization.set("mul")
+                app.plate_solve_order.set(4)
+                app.plate_solve_downscale.set(True)
+                app.plate_solve_radius.set("3.5")
+                app.plate_solve_limit_mag.set("-1")
+                app.rbf_smoothing.set(0.8)
+                app.background_dither.set(False)
+                app.registration_transform.set("affine")
+                app.registration_minpairs.set(6)
+                app.registration_maxstars.set(800)
+                app.registration_interpolation.set("linear")
+                app.random_seed.set("77")
                 app.filter_background.set(93)
                 app.adaptive_quality_filtering.set(True)
                 app.quality_filter_sigma.set(2.6)
@@ -1023,11 +2680,24 @@ class SirilMosaicTests(unittest.TestCase):
                 app.save_profile(notify=False)
 
                 app.drizzle_scale.set(2.5)
+                app.drizzle_kernel.set("lanczos2")
+                app.rejection_method.set("linear")
                 app.bayer_pattern.set("Auto (header)")
                 app.cosmetic_correction.set(True)
                 app.cosmetic_cold_sigma.set(2.5)
                 app.cosmetic_hot_sigma.set(2.0)
                 app.overlap_normalization.set(True)
+                app.plate_solve_order.set(3)
+                app.plate_solve_downscale.set(False)
+                app.plate_solve_radius.set("")
+                app.plate_solve_limit_mag.set("")
+                app.rbf_smoothing.set(0.5)
+                app.background_dither.set(True)
+                app.registration_transform.set("homography")
+                app.registration_minpairs.set(0)
+                app.registration_maxstars.set(0)
+                app.registration_interpolation.set("lanczos4")
+                app.random_seed.set("")
                 app.filter_background.set(99)
                 app.adaptive_quality_filtering.set(False)
                 app.quality_filter_sigma.set(4.0)
@@ -1037,16 +2707,30 @@ class SirilMosaicTests(unittest.TestCase):
                 app.load_profile(notify=False)
 
                 self.assertEqual(app.drizzle_scale.get(), 1.7)
+                self.assertEqual(app.drizzle_kernel.get(), "gaussian")
+                self.assertEqual(app.rejection_method.get(), "winsorized")
                 self.assertEqual(app.bayer_pattern.get(), "RGGB")
                 self.assertFalse(app.cosmetic_correction.get())
                 self.assertEqual(app.cosmetic_cold_sigma.get(), 4.5)
                 self.assertEqual(app.cosmetic_hot_sigma.get(), 4.0)
                 self.assertFalse(app.overlap_normalization.get())
+                self.assertEqual(app.stack_normalization.get(), "mul")
+                self.assertEqual(app.plate_solve_order.get(), 4)
+                self.assertTrue(app.plate_solve_downscale.get())
+                self.assertEqual(app.plate_solve_radius.get(), "3.5")
+                self.assertEqual(app.plate_solve_limit_mag.get(), "-1")
+                self.assertEqual(app.rbf_smoothing.get(), 0.8)
+                self.assertFalse(app.background_dither.get())
+                self.assertEqual(app.registration_transform.get(), "affine")
+                self.assertEqual(app.registration_minpairs.get(), 6)
+                self.assertEqual(app.registration_maxstars.get(), 800)
+                self.assertEqual(app.registration_interpolation.get(), "linear")
+                self.assertEqual(app.random_seed.get(), "77")
                 self.assertEqual(app.filter_background.get(), 93)
                 self.assertTrue(app.adaptive_quality_filtering.get())
                 self.assertEqual(app.quality_filter_sigma.get(), 2.6)
                 self.assertEqual(app.background_method.get(), "Linear")
-                self.assertTrue(app.fast_normalization.get())
+                self.assertFalse(app.fast_normalization.get())
                 self.assertTrue(app.debug.get())
                 stored = json.loads(profile_path.read_text(encoding="utf-8"))
                 self.assertIn("OSC drizzle", stored["profiles"])
@@ -1111,6 +2795,73 @@ class SirilMosaicTests(unittest.TestCase):
             finally:
                 root.destroy()
 
+    def test_gui_warns_about_overlap_normalization_for_large_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=201)
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root, profile_path=Path(directory) / "profiles.json")
+                app.workdir.set(str(workdir))
+                app.output_dir.set(str(Path(directory) / "output"))
+                app.siril_exe.set(str(executable))
+                app.substacks.set(1)
+                app.overlap_normalization.set(True)
+                with patch(
+                    "sirilmosaic_gui.messagebox.askyesno", return_value=False
+                ) as askyesno:
+                    app.start()
+
+                confirmation = askyesno.call_args.args[1]
+                self.assertIn("Performance warning", confirmation)
+                self.assertIn("201 light files were detected", confirmation)
+                self.assertIn("overlap normalization is enabled", confirmation)
+                self.assertFalse(app.running)
+            finally:
+                root.destroy()
+
+    def test_fast_normalization_requires_overlap_normalization(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            assert app.fast_normalization_widget is not None
+            app.fast_normalization.set(True)
+            app.overlap_normalization.set(False)
+            app.update_normalization_controls()
+            self.assertTrue(app.fast_normalization_widget.instate(("disabled",)))
+            self.assertFalse(app.fast_normalization.get())
+            app.overlap_normalization.set(True)
+            app.update_normalization_controls()
+            self.assertFalse(app.fast_normalization_widget.instate(("disabled",)))
+        finally:
+            root.destroy()
+
+    def test_rejection_method_changes_apply_base_thresholds(self) -> None:
+        root = self.gui_root()
+        root.withdraw()
+        try:
+            app = SirilMosaicApp(root)
+            expected = {
+                "none": (3.0, 3.0),
+                "percentile": (0.2, 0.1),
+                "sigma": (3.0, 3.0),
+                "mad": (3.0, 3.0),
+                "median": (3.0, 3.0),
+                "linear": (3.0, 3.0),
+                "winsorized": (3.0, 3.0),
+                "generalized": (0.3, 0.05),
+            }
+            for method, (low, high) in expected.items():
+                app.rejection_method.set(method)
+                app.rejection_low.set(99)
+                app.rejection_high.set(99)
+                app.rejection_method_changed()
+                self.assertEqual(app.rejection_low.get(), low)
+                self.assertEqual(app.rejection_high.get(), high)
+        finally:
+            root.destroy()
+
     @patch("sirilmosaic_gui.psutil.wait_procs", return_value=([], []))
     @patch("sirilmosaic_gui.psutil.Process")
     def test_cancel_targets_only_siril_descendants(self, process_class, wait_procs) -> None:
@@ -1149,6 +2900,21 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertIsNotNone(app.process)
             thread_class.assert_called_once()
 
+    def test_gui_event_queue_sheds_logs_but_preserves_control_event(self) -> None:
+        app = SirilMosaicApp.__new__(SirilMosaicApp)
+        app.events = Queue(maxsize=2)
+        app.dropped_log_events = 0
+        app._queue_event('log', 'one')
+        app._queue_event('log', 'two')
+        app._queue_event('log', 'three')
+        app._queue_event('done', 0)
+
+        queued = []
+        while not app.events.empty():
+            queued.append(app.events.get_nowait())
+        self.assertIn(('done', 0), queued)
+        self.assertGreater(app.dropped_log_events, 0)
+
     def test_partial_staging_can_be_fully_restored_after_cancellation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workdir, _ = self.make_project(Path(directory))
@@ -1172,6 +2938,60 @@ class SirilMosaicTests(unittest.TestCase):
             sirilmosaic.cleanup(1, restore_sources=True)
 
             self.assertEqual(set(sirilmosaic.discover_light_files(workdir)), original_paths)
+
+    def test_frame_selection_rejects_move_to_mirrored_rejects_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, _ = self.make_project(Path(directory))
+            sirilmosaic.workdir = workdir
+            sirilmosaic.journal_path = None
+            relative_path = Path('panel_1') / 'lights' / 'light.fit'
+            moved = sirilmosaic.move_frame_selection_rejects([
+                {
+                    'file': relative_path.as_posix(),
+                    'status': 'rejected',
+                    'reason_code': 'registration_excluded',
+                },
+                {
+                    'file': 'panel_2/lights/light.xisf',
+                    'status': 'failed',
+                    'reason_code': 'plate_solving_failed',
+                },
+            ])
+
+            self.assertEqual(len(moved), 1)
+            self.assertFalse((workdir / relative_path).exists())
+            self.assertTrue((workdir / 'rejects' / relative_path).is_file())
+            self.assertEqual(len(sirilmosaic.discover_light_files(workdir)), 3)
+
+    def test_rejected_frames_restore_before_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, _ = self.make_project(Path(directory))
+            sirilmosaic.workdir = workdir
+            sirilmosaic.journal_path = None
+            relative_path = Path('panel_1') / 'lights' / 'light.fit'
+            source = workdir / relative_path
+            rejects_path = workdir / 'rejects' / relative_path
+            rejects_path.parent.mkdir(parents=True)
+            shutil.move(str(source), str(rejects_path))
+
+            restored = sirilmosaic.restore_rejected_frames()
+
+            self.assertEqual(restored, [relative_path.as_posix()])
+            self.assertTrue(source.is_file())
+            self.assertFalse((workdir / 'rejects').exists())
+            self.assertEqual(len(sirilmosaic.discover_light_files(workdir)), 4)
+
+    def test_rejected_frame_restore_refuses_destination_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, _ = self.make_project(Path(directory))
+            sirilmosaic.workdir = workdir
+            relative_path = Path('panel_1') / 'lights' / 'light.fit'
+            rejects_path = workdir / 'rejects' / relative_path
+            rejects_path.parent.mkdir(parents=True)
+            shutil.copy2(workdir / relative_path, rejects_path)
+
+            with self.assertRaisesRegex(RuntimeError, 'destination files already exist'):
+                sirilmosaic.restore_rejected_frames()
 
     def test_pipeline_reports_successful_cancellation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1211,10 +3031,54 @@ class SirilMosaicTests(unittest.TestCase):
             arguments = sirilmosaic.build_parser().parse_args([
                 '--workdir', str(workdir), '--siril-exe', str(executable),
             ])
-            with patch('pysiril.siril.Siril'), self.assertRaises(FileExistsError):
+            with patch('pysiril.siril.Siril'), self.assertRaisesRegex(ValueError, 'Resume Run'):
                 sirilmosaic.run_pipeline(arguments)
             self.assertEqual({path: path.read_bytes() for path in staging.rglob('*') if path.is_file()}, before)
             self.assertFalse((workdir / 'prior_source.fit').exists())
+
+    def test_abandon_interrupted_run_restores_sources_and_clears_recovery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / "workdir"
+            output = root / "output"
+            staged = workdir / "Lights_sorted" / "group_1" / "lights"
+            staged.mkdir(parents=True)
+            output.mkdir()
+            (staged / "frame_00001.fit").write_bytes(b"source")
+            (workdir / "Lights_sorted" / "group_1" / sirilmosaic.SOURCE_MANIFEST).write_text(
+                json.dumps({"frame_00001.fit": "lights/source.fit"}), encoding="utf-8"
+            )
+            checkpoint = output / "run_checkpoint.json"
+            checkpoint.write_text("{}", encoding="utf-8")
+            result = sirilmosaic.abandon_interrupted_run(workdir, output)
+
+            self.assertEqual(result["restored"], 1)
+            self.assertEqual((workdir / "lights" / "source.fit").read_bytes(), b"source")
+            self.assertFalse((workdir / "Lights_sorted").exists())
+            self.assertFalse(checkpoint.exists())
+
+    def test_gui_blocks_fresh_start_when_recovery_state_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir, executable = self.make_project(Path(directory), light_count=1)
+            output = Path(directory) / "output"
+            output.mkdir()
+            (output / "run_checkpoint.json").write_text("{}", encoding="utf-8")
+            (workdir / "Lights_sorted").mkdir()
+            root = self.gui_root()
+            root.withdraw()
+            try:
+                app = SirilMosaicApp(root)
+                app.workdir.set(str(workdir))
+                app.output_dir.set(str(output))
+                app.siril_exe.set(str(executable))
+                app.substacks.set(1)
+                with patch("sirilmosaic_gui.messagebox.showerror") as showerror:
+                    app.start()
+                showerror.assert_called_once()
+                self.assertIn("Use Resume Run", showerror.call_args.args[1])
+                self.assertFalse(app.running)
+            finally:
+                root.destroy()
 
     def test_pipeline_retries_command_failures_with_clean_generated_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1248,6 +3112,134 @@ class SirilMosaicTests(unittest.TestCase):
             self.assertEqual(len(sirilmosaic.quality_report['substack_attempt_failures']), 1)
             self.assertEqual(len(sirilmosaic.discover_light_files(workdir)), 4)
 
+    def test_resume_checkpoint_round_trip_recovers_and_restages_incomplete_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / 'frames'
+            output = root / 'output'
+            workdir.mkdir()
+            output.mkdir()
+            (workdir / 'light_01.fit').write_bytes(b'complete')
+            lights_sorted = workdir / 'Lights_sorted'
+            completed = lights_sorted / 'group_1' / 'lights'
+            incomplete = lights_sorted / 'group_2' / 'lights'
+            completed.mkdir(parents=True)
+            incomplete.mkdir(parents=True)
+            (lights_sorted / 'group_1' / sirilmosaic.SOURCE_MANIFEST).write_text(
+                json.dumps({'frame_00001.fit': 'light_01.fit'}), encoding='utf-8'
+            )
+            (lights_sorted / 'group_1' / 'substack_1.fit').write_bytes(b'substack')
+            (lights_sorted / 'group_2' / sirilmosaic.SOURCE_MANIFEST).write_text(
+                json.dumps({'frame_00001.fit': 'light_02.fit'}), encoding='utf-8'
+            )
+            (incomplete / 'frame_00001.fit').write_bytes(b'incomplete')
+            sirilmosaic.workdir = workdir
+            sirilmosaic.output_dir = output
+            checkpoint = {
+                'schema_version': 1,
+                'run_id': 'resume_test',
+                'workdir': str(workdir),
+                'output_dir': str(output),
+                'substack_count': 2,
+                'completed_substacks': [1],
+                'groups': {'1': ['light_01.fit'], '2': ['light_02.fit']},
+            }
+            sirilmosaic.write_run_checkpoint(checkpoint)
+
+            loaded = sirilmosaic.load_run_checkpoint()
+            completed_groups = sirilmosaic.prepare_resume_staging(loaded)
+
+            self.assertEqual(completed_groups, {1})
+            self.assertTrue((lights_sorted / 'group_1' / 'substack_1.fit').is_file())
+            self.assertTrue((lights_sorted / 'group_2' / 'lights' / 'frame_00001.fit').is_file())
+            self.assertFalse((workdir / 'light_02.fit').exists())
+
+    def test_pipeline_resume_skips_completed_substack(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir, executable = self.make_project(root, light_count=4)
+            output = root / 'output'
+            output.mkdir()
+            base_arguments = sirilmosaic.build_parser().parse_args([
+                '--workdir', str(workdir), '--output-dir', str(output),
+                '--siril-exe', str(executable), '--substacks', '2',
+                '--no-drizzle', '--no-cosmetic-correction', '--no-overlap-normalization',
+                '--background-method', 'off', '--seed', '12345',
+            ])
+            sirilmosaic.configure(base_arguments)
+            selected = sorted(sirilmosaic.discover_light_files(workdir), key=lambda path: path.name)
+            input_manifest = sirilmosaic.write_input_manifest(selected, [(None, selected)])
+            sirilmosaic.quality_report = sirilmosaic.initialize_quality_report(len(selected))
+            sirilmosaic.quality_report['input_summary'] = sirilmosaic.summarize_input_frames(selected)
+            sirilmosaic.quality_report['cohorts'] = sirilmosaic.summarize_frame_cohorts(selected)
+            sirilmosaic.quality_report['input_manifest'] = str(input_manifest)
+            sirilmosaic.quality_report['substacks'] = [{
+                'number': 1,
+                'input_frames': 2,
+                'accepted_frames': 2,
+                'rejected_frames': 0,
+                'stack': {'stacked_frames': 2},
+            }]
+            sirilmosaic.write_quality_report('running')
+            lights_sorted = workdir / 'Lights_sorted'
+            group_one = lights_sorted / 'group_1' / 'lights'
+            group_one.mkdir(parents=True)
+            (lights_sorted / 'group_1' / sirilmosaic.SOURCE_MANIFEST).write_text(
+                json.dumps({}), encoding='utf-8'
+            )
+            (lights_sorted / 'group_1' / 'substack_1.fit').write_bytes(b'complete')
+            checkpoint = {
+                'schema_version': 1,
+                'state': 'interrupted',
+                'run_id': sirilmosaic.run_id,
+                'workdir': str(workdir),
+                'output_dir': str(output),
+                'configuration_hash': sirilmosaic.configuration_hash(),
+                'seed': sirilmosaic.run_seed,
+                'input_frames': 4,
+                'selected_files': [path.relative_to(workdir).as_posix() for path in selected],
+                'input_manifest': str(input_manifest),
+                'quality_report': str(sirilmosaic.quality_report_path()),
+                'frame_ledger': str(sirilmosaic.frame_ledger_file_path()),
+                'substack_count': 2,
+                'groups': {
+                    '1': [path.relative_to(workdir).as_posix() for path in selected[:2]],
+                    '2': [path.relative_to(workdir).as_posix() for path in selected[2:]],
+                },
+                'completed_substacks': [1],
+            }
+            sirilmosaic.write_run_checkpoint(checkpoint)
+            attempts = []
+
+            def resume_substack(group_number):
+                attempts.append(group_number)
+                sirilmosaic.quality_report['substacks'].append({
+                    'number': group_number,
+                    'input_frames': 2,
+                    'accepted_frames': 2,
+                    'rejected_frames': 0,
+                    'discarded_frames': [],
+                    'stack': {'stacked_frames': 2},
+                })
+                return True
+
+            resume_arguments = sirilmosaic.build_parser().parse_args([
+                '--workdir', str(workdir), '--output-dir', str(output),
+                '--siril-exe', str(executable), '--substacks', '2',
+                '--no-drizzle', '--no-cosmetic-correction', '--no-overlap-normalization',
+                '--background-method', 'off', '--resume',
+            ])
+            fake = Mock()
+            fake.Open.return_value = True
+            with patch('pysiril.siril.Siril', return_value=fake), patch(
+                'sirilmosaic.substack', side_effect=resume_substack
+            ), patch('sirilmosaic.masterstack'), patch('sirilmosaic.finalize_integration_report'):
+                result = sirilmosaic.run_pipeline(resume_arguments)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(attempts, [2])
+            self.assertFalse((output / sirilmosaic.RUN_CHECKPOINT).exists())
+
     def test_pipeline_closes_siril_before_cancellation_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workdir, executable = self.make_project(Path(directory))
@@ -1279,7 +3271,9 @@ class SirilMosaicTests(unittest.TestCase):
 
             self.assertEqual(result, 2)
             self.assertLess(events.index("close"), events.index("cleanup"))
-            self.assertFalse((workdir / "Lights_sorted").exists())
+            self.assertTrue((workdir / "Lights_sorted").exists())
+            self.assertTrue((output_dir / sirilmosaic.RUN_CHECKPOINT).is_file())
+            self.assertEqual(len(sirilmosaic.discover_light_files(workdir)), 4)
 
     def test_configured_commands_match_pipeline_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1294,6 +3288,7 @@ class SirilMosaicTests(unittest.TestCase):
                 "--drizzle",
                 "--drizzle-scale", "1.5",
                 "--pixel-fraction", "0.7",
+                "--drizzle-kernel", "square",
                 "--bayer-pattern", "BGGR",
                 "--bayer-orientation", "bottom-up",
                 "--cosmetic-correction",
@@ -1308,6 +3303,8 @@ class SirilMosaicTests(unittest.TestCase):
                 "--feather", "24",
                 "--rejection-low", "2.5",
                 "--rejection-high", "3.5",
+                "--rejection-method", "winsorized",
+                "--stack-normalization", "mulscale",
                 "--catalog", "gaia",
             ])
             sirilmosaic.configure(arguments)
@@ -1320,9 +3317,10 @@ class SirilMosaicTests(unittest.TestCase):
             stacking = next(command for command in fake.commands if command.startswith("stack "))
             self.assertIn("-filter-bkg=94%", registration)
             self.assertIn("-scale=1.5 -pixfrac=0.7", registration)
-            self.assertIn("rej linear 2.5 3.5", stacking)
+            self.assertIn("-kernel=square", registration)
+            self.assertIn("rej winsorized 2.5 3.5", stacking)
             self.assertIn("-weight=nbstars", stacking)
-            self.assertIn("-norm=addscale", stacking)
+            self.assertIn("-norm=mulscale", stacking)
             self.assertIn("-overlap_norm", stacking)
             self.assertIn("-rejmaps", stacking)
             self.assertNotIn("-rejmap ", stacking)
@@ -1416,7 +3414,7 @@ class SirilMosaicTests(unittest.TestCase):
             stacking = next(command for command in fake.commands if command.startswith("stack "))
             self.assertEqual(
                 background,
-                "seqsubsky pp_light -rbf -samples=32 -tolerance=1.4",
+                "seqsubsky pp_light -rbf -samples=32 -tolerance=1.4 -smooth=0.5",
             )
             self.assertIn("-filter-bkg=2.75k", registration)
             self.assertIn("-filter-nbstars=2.75k", registration)
@@ -1551,7 +3549,8 @@ class SirilMosaicTests(unittest.TestCase):
             fake = FakeSiril()
             sirilmosaic.app = fake
 
-            sirilmosaic.masterstack(1)
+            with patch.object(sirilmosaic, 'require_siril_artifact'):
+                sirilmosaic.masterstack(1)
 
             self.assertEqual((sirilmosaic.output_dir / "master_stack_test_run.fit").read_bytes(), b"rgb-stack")
             self.assertEqual(
@@ -1583,7 +3582,8 @@ class SirilMosaicTests(unittest.TestCase):
             fake = FakeSiril()
             sirilmosaic.app = fake
 
-            sirilmosaic.masterstack(2)
+            with patch.object(sirilmosaic, 'require_siril_artifact'):
+                sirilmosaic.masterstack(2)
 
             stacking = next(command for command in fake.commands if command.startswith("stack "))
             self.assertNotIn("-overlap_norm", stacking)
@@ -1617,13 +3617,15 @@ class SirilMosaicTests(unittest.TestCase):
             sirilmosaic.fast_normalization = False
             sirilmosaic.rej_low = "2.5"
             sirilmosaic.rej_high = "3.5"
+            sirilmosaic.pixel_rejection_method = "winsorized"
             fake = FakeSiril()
             sirilmosaic.app = fake
 
-            sirilmosaic.masterstack(4)
+            with patch.object(sirilmosaic, 'require_siril_artifact'):
+                sirilmosaic.masterstack(4)
 
             stacking = next(command for command in fake.commands if command.startswith("stack "))
-            self.assertIn("rej linear 2.5 3.5", stacking)
+            self.assertIn("rej winsorized 2.5 3.5", stacking)
             self.assertIn("-weight=nbstack", stacking)
             self.assertIn("-rejmaps", stacking)
 
@@ -1638,6 +3640,18 @@ class SirilMosaicTests(unittest.TestCase):
             sirilmosaic.configure(arguments)
             with self.assertRaisesRegex(ValueError, "cannot exceed"):
                 sirilmosaic.validate_parameters()
+
+    def test_require_siril_artifact_validates_fits_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            valid = Path(directory) / 'valid.fit'
+            invalid = Path(directory) / 'invalid.fit'
+            self.write_fits_layer_header(valid, 1)
+            invalid.write_bytes(b'not fits')
+
+            artifact = sirilmosaic.require_siril_artifact(valid, 'test artifact')
+            self.assertEqual((artifact['width'], artifact['height']), (10, 10))
+            with self.assertRaises(sirilmosaic.SirilCommandError):
+                sirilmosaic.require_siril_artifact(invalid, 'test artifact')
 
 
 if __name__ == "__main__":

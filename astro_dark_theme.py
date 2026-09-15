@@ -52,6 +52,27 @@ def configure_dark_theme(window: Any) -> Any:
     style.configure("TFrame", background=DARK_BG)
     style.configure("TLabel", background=DARK_BG, foreground=DARK_TEXT)
     style.configure(
+        "TNotebook",
+        background=DARK_BG,
+        bordercolor=DARK_BORDER,
+        tabmargins=(0, 0, 0, 0),
+    )
+    style.configure(
+        "TNotebook.Tab",
+        background=DARK_SURFACE,
+        foreground=DARK_TEXT,
+        bordercolor=DARK_BORDER,
+        padding=(11, 5),
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", DARK_ACCENT), ("active", "#30343d")],
+        foreground=[("selected", "#ffffff"), ("active", "#ffffff")],
+        bordercolor=[("selected", DARK_ACCENT_ACTIVE), ("active", DARK_BORDER)],
+        padding=[("selected", (18, 8)), ("active", (13, 6))],
+    )
+    style.configure(
         "TButton",
         background=DARK_SURFACE,
         foreground=DARK_TEXT,

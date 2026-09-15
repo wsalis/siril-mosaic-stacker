@@ -1,6 +1,36 @@
 # Siril Mosaic Stacker
 
-**Version 1.4**
+**Version 2.0**
+
+In a nutshell, this is an automated Python front end into [Siril](https://siril.org/) specifically for stacking. This project came about because I wanted and needed a way to stack mixed mosaic astrophotography data that doesn't get nicely grouped into tiles for traditional stacking. For example, data gathered of the same deep sky object over multiple years where orientation and equipment may differ.
+
+It cosmetic corrects light files, corrects for gradients, registers and integrates each group, then creates a final registered master stack.
+
+There are also some auto-filtering features to help filter out potentially bad data from large datasets. There's also an autocrop feature if you're able to do everything as a single stack for the moment. I'll work on a way to autocrop if there are multiple substacks as I go.
+
+Overall, this gives a pretty good single-click process and let your computer do the work. You just load up your raw light files into a directory, point the application to that directory, and run. After a while you will get a master stack, a cropped stack (if you chose to autocrop), high/low rejection files, a mosaic coverage map (indicates which parts of the master stack have the most integration time), and a frame selection quality report.
+
+This is suitable for both dedicated rig data (larger files, longer exposures) and large numbers of smart scope lights (smaller files, shorter exposures).
+
+Small word of warning, though using the overlap normalization feature sounds nice, you really only want to use it when you are stacking dedicated rig data where you aren't dealing with thousands of files. If you enable this when you have lots of lights to process, it runs that process very slowly. There's a fast normalization option but really you don't want to enable this if you're doing work with a bunch of smart scope light frames. It's better for when you're working with a few hundred light files.
+
+Happy stacking!
+
+## Overview
+
+Siril Mosaic Stacker is an automated Python front end for [Siril](https://siril.org/) focused specifically on stacking. It was created to handle mixed mosaic astrophotography data that does not divide neatly into traditional tiles, such as observations of the same deep-sky object collected over multiple years with different orientations or equipment.
+
+It can cosmetic-correct light files, remove gradients, register and integrate each group, and create a final registered master stack. Automatic filtering helps identify potentially poor data in large collections. When the data can be processed as a single stack, the optional auto-crop feature can also create a cropped master.
+
+The goal is a largely single-click workflow: place your raw light files in a directory, point the application to that directory, and start the run. Depending on the selected options, the output can include a master stack, cropped master, high/low rejection maps, a mosaic coverage map showing where integration time is concentrated, and a frame-selection quality report.
+
+The application is suitable for both dedicated-rig data with larger files and longer exposures, and large numbers of smart-scope light frames with smaller files and shorter exposures.
+
+### Overlap Normalization Warning
+
+Overlap normalization can be useful for dedicated-rig data, but it is computationally expensive. Avoid enabling it for collections containing thousands of smart-scope light frames; it can make processing extremely slow. Fast normalization is available, but overlap normalization is still best reserved for smaller datasets, such as a few hundred dedicated-rig light files.
+
+Happy stacking!
 
 A source-safe graphical workflow for stacking large mosaics and high-frame-count image sets with [Siril](https://siril.org/). It groups source frames into randomized substacks, registers and integrates each group, then creates a final registered master stack.
 
@@ -11,7 +41,7 @@ A source-safe graphical workflow for stacking large mosaics and high-frame-count
 - CFA metadata preflight with explicit Bayer pattern and row-orientation controls
 - Optional CFA cosmetic correction with separate cold/hot sigma controls
 - Percentage or adaptive k-sigma quality filtering
-- Drizzle, overlap normalization, rejection, weighting, and feathering controls
+- Drizzle kernel, overlap normalization, pixel rejection method, weighting, and feathering controls
 - Optional fast normalization for large light-frame sets
 - Optional failed-frame skipping that records excluded calibrated frames in logs and JSON reports
 - Optional automatic substack sizing for large sequences (8192-frame Siril UCRT64 limit)
@@ -22,6 +52,7 @@ A source-safe graphical workflow for stacking large mosaics and high-frame-count
 - Optional test-mode frame sampling for quick runs without changing directories
 - Progress estimates, cancellation, logs, profiles, and JSON quality reports
 - Avoids statistically weak master rejection when fewer than four substacks exist
+- Advanced Siril controls for plate solving, background extraction, registration, and reproducible seeds
 
 ## Requirements
 
@@ -67,6 +98,29 @@ The same Python GUI and processing pipeline can be launched with `python3 sirilm
 
 The application temporarily stages source frames and restores them to their original relative paths. Do not edit `Lights_sorted` during a run. Keep independent backups of irreplaceable acquisitions.
 
+Each run records a human-readable log, a JSON quality report, a JSONL event journal, and an input manifest containing the selected files, acquisition cohorts, configuration hash, and random seed. These artifacts make large or failed runs easier to inspect and reproduce.
+
+## Documentation
+
+- [Command Cookbook](docs/COMMAND_COOKBOOK.md)
+- [Artifact Reference](docs/ARTIFACT_REFERENCE.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Compatibility Matrix](docs/COMPATIBILITY.md)
+- [FAQ](docs/FAQ.md)
+- [Validation Matrix](docs/VALIDATION_MATRIX.md)
+- [Healthy Run Example](docs/HEALTHY_RUN_EXAMPLE.md)
+- [Visual Guide](docs/VISUAL_GUIDE.md)
+- [Release Checklist](docs/RELEASE_CHECKLIST.md)
+- [Changelog](CHANGELOG.md)
+
+Drizzle uses Siril's selectable `point`, `turbo`, `square`, `gaussian`, `lanczos2`, or `lanczos3` kernels; `lanczos3` is the default. Droplet size controls Siril's `pixfrac` value from 0.1 to 1.0; `0.8` is the default. Pixel rejection supports `none`, `percentile`, `sigma`, `mad`, `median`, `linear`, `winsorized`, and `generalized`. `linear` is the default. Percentile and generalized rejection use low/high parameters from 0 to 1; the other active rejection methods use the existing sigma-like threshold fields. The selected method applies to substack integration and, when at least four substacks are present, final master integration.
+
+The Advanced tab exposes selected Siril 1.4 controls without changing the safe Basic workflow: SIP plate-solve order, downscale and search hints, RBF smoothing and dithering, registration transform/interpolation, minimum star pairs, maximum stars, and an optional reproducibility seed. Values left at their defaults preserve the normal command path.
+
+Stack normalization supports Siril's `add`, `mul`, `addscale`, and `mulscale` modes. The default is `addscale`, which combines additive background correction with scaling. The selected mode applies to substack and final-master integration.
+
+During file-processing phases, the progress text estimates completed files as `current/total`; phases such as master integration and final output writing do not show a file count.
+
 ## Large Collections
 
 Siril's experimental Windows UCRT64 build supports up to 8,192 files in a sequence. For large collections such as Seestar captures, enable `Auto substacks (max 8192 frames each)`. The app counts eligible FITS/XISF inputs and divides them into enough substacks to stay within that limit.
@@ -87,9 +141,25 @@ Before starting, the GUI estimates peak working storage from the input data size
 
 At completion, the JSON report and GUI completion dialog report integrated exposure by summing finite, positive `EXPTIME` values from the actual registered files selected for stacking. Exact integrated seconds/hours are `null` when metadata or stack membership is incomplete; there is no frame-proportional fallback. `exposure_complete` and `integrated_exposure_basis` explain availability. Input exposure totals cover only readable positive metadata, with missing-frame counts reported separately. These times describe contributing frames before per-pixel rejection and weighting.
 
-Each completed substack includes a compact `discarded_frames` list: original relative filename, sequence image number, exposure, stage completion flags, status, and `reason_code`. Successful filenames are omitted. Explicit plate-solving failures are identified; otherwise `candidate_filters` are run-wide possibilities, not confirmed individual rejection causes. Unknown stack membership is counted separately and is never labeled as a known discard. Numbered staging names and the source manifest preserve source identity across filename extensions. `stage_exposure_seconds` is exact or `null`; `stage_known_exposure_seconds` and `stage_missing_exposure_frames` expose incomplete metadata.
+Each completed substack includes a compact `discarded_frames` list: original relative filename, sequence image number, exposure, stage completion flags, status, and `reason_code`. For frame-selection exclusions, `filter_metrics` includes the measured Siril value, threshold, comparison, and pass/fail status for every active quality filter when sequence registration records are available, including metrics that passed on the rejected frame. `filter_metric_source` identifies whether those values came from Siril sequence registration data or were unavailable. Successful filenames are omitted. Explicit plate-solving failures are identified; otherwise `candidate_filters` are run-wide possibilities, not confirmed individual rejection causes. Unknown stack membership is counted separately and is never labeled as a known discard. Numbered staging names and the source manifest preserve source identity across filename extensions. `stage_exposure_seconds` is exact or `null`; `stage_known_exposure_seconds` and `stage_missing_exposure_frames` expose incomplete metadata.
 
-Report schema version 2 records the effective selection mode and Siril flags, command durations/status, failed-command response tails, and substack attempt failures. Reports are replaced atomically. Final registration export totals take precedence over preliminary filter counts; stack dimensions come from the saved output. A command failure before a substack completes may have command-level diagnostics without a complete per-frame summary. Multi-substack integrated exposure is withheld unless all contributing substacks are confirmed in the final stack.
+Each run also writes `frame_ledger_<run_id>.jsonl`, one record per selected frame. It includes the original relative filename, cohort, substack, exposure, every active filter metric, stage completion flags, stack membership, final status, and rejection reason where applicable. The ledger is appended after each successful substack and is independently checked by Run Verification.
+
+Report schema version 3 records the effective selection mode and Siril flags, command durations/status, response tails, reproducibility metadata, and substack attempt failures. Reports are replaced atomically. Final registration export totals take precedence over preliminary filter counts; stack dimensions come from the saved output. A command failure before a substack completes may have command-level diagnostics without a complete per-frame summary. Multi-substack integrated exposure is withheld unless all contributing substacks are confirmed in the final stack.
+
+The `Run Review` tab includes `Verify Run`, which performs a read-only PASS/WARN/FAIL audit of the report status, journal JSONL integrity, input manifest, frame accounting, master and coverage dimensions, crop artifacts, source restoration, and reject-folder agreement. Completed runs automatically write `verification_<run_id>.json` beside the quality report. The same audit is available from the CLI with `--verify-run <quality_report.json>`.
+
+`Open Frame Ledger` provides filterable full-frame evidence by status, metric failure, and filename; `Export Ledger CSV` writes the filtered view for inspection outside the GUI. Low-cardinality fields use value dropdowns, while file/path fields keep case-insensitive `Contains` search. Table headers sort values, and `Clear Sort & Filter` restores the complete table and default order.
+
+`Preview Run` runs the same integrity scan first and includes its PASS/WARN/FAIL findings alongside the dry-run command and storage/cohort summary.
+
+The analysis workspace adds report-driven views. `Run History` scans the selected output folder, compares two completed runs, verifies a selected report, and exports ZIP or self-contained HTML evidence. Selecting exactly one history row makes it active and automatically refreshes Run Review, Threshold Lab, Quality Explorer, Frame Inspector, Cohort Balance, Coverage Inspector, Visual QA, and Cropping Workbench. `Threshold Lab` interactively replays keep-best targets from one cached ledger. `Quality Explorer` plots measured FWHM, roundness, background, or star metrics with recorded threshold lines. `Frame Inspector` links each ledger row to its source preview, metrics, thresholds, rejection reason, and stage state. `Cohort Balance` compares per-cohort totals, retention, rejects, and integrated exposure. `Coverage Inspector` previews the saved integration-time map and summarizes canvas, crop, and integration statistics. `Visual QA` performs preview-level checks for blank edges, clipping, broad gradients, coverage holes, and artifact geometry. `Batch Queue` processes multiple folders sequentially using the current settings.
+
+The Help button opens a tabbed module guide. Each Help tab corresponds to a major application area and explains its selections, tradeoffs, evidence, safety behavior, and recovery workflow.
+
+Run Review can export a ZIP evidence bundle containing the report, automatic verification artifact, manifest, frame ledger, configuration summary, journal, and relevant logs without including raw light frames. `Cleanup Review` lists temporary staging, checkpoints, locks, `.tmp` files, and launcher logs without deleting anything automatically. Staged source folders, active locks, and rejects are review-only and cannot be removed by that action. The main Start/Resume action row holds the less-frequent `Checkpoint Status`, `Discard Checkpoint`, `Abandon Run`, `Run Lock Status`, and `Break Run Lock` controls. `Abandon Run` restores staged sources, removes temporary staging/substacks and checkpoint metadata, and retains reports/logs before a fresh start. `Preview Run` performs the deep integrity scan first and includes PASS/WARN/FAIL findings in its preview; the CLI also exposes `--integrity-scan` for standalone preflight use.
+
+The backend watchdog defaults to a 60-second Siril open timeout and a one-hour command timeout. Override them with `--siril-open-timeout` and `--siril-command-timeout`; use zero only when deliberately disabling a watchdog. `--minimum-free-disk-gb` defaults to 0.5 and is checked after each completed substack. A timed-out Siril pipe is marked unhealthy, descendant Siril processes are terminated, and the run rolls back rather than continuing with an uncertain command state.
 
 The completion output includes a relative filter-retention score from 0 to 100 under the legacy `sky_condition` report key. It combines background, FWHM, roundness, and plate-solving pass fractions; mosaic-aware mode excludes raw star count. It depends on the selected filters and input population, so it is not an objective measure of sky quality, a Bortle classification, or a selector itself.
 
@@ -102,16 +172,18 @@ The completion output includes a relative filter-retention score from 0 to 100 u
 
 Enable `Mosaic-aware star count` when one run contains frames from different sky regions. Star count remains available in registration diagnostics, but raw star count is removed from global rejection and sky scoring so naturally sparse fields are not penalized.
 
-The preflight summary and JSON report group frames into acquisition cohorts using camera model, exposure time, gain, filter, and image dimensions. This is useful for mixed Seestar S30/S50 and Pro collections. The current cohort feature is diagnostic only: grouping remains randomized and quality filters are still global.
+The preflight summary and JSON report group frames into acquisition cohorts using camera model, exposure time, gain, filter, and image dimensions. This is useful for mixed Seestar S30/S50 and Pro collections. Enable `Export one master per acquisition cohort` to process each cohort independently and write `master_stack_<run_id>_cohort_###_camera-<camera>_exp-<seconds>s_gain-<gain>_filter-<filter>_size-<width>x<height>.fit` outputs. When coverage is enabled, each cohort also receives matching tagged coverage maps and an optional cropped master.
 
 Enable `Write coverage map` to sum each registered frame's `EXPTIME` wherever it has finite, nonzero signal on the full mosaic canvas. A 60-second frame overlapping a 300-second frame contributes 360 seconds, not two equal frame counts. Two FITS outputs are written:
 
-- `coverage_map_<run_id>.fit`: a floating-point 0-1 viewing map. Black means no data; white marks the greatest integration time. Multiply a pixel by the report's `normalization_seconds` to recover seconds.
-- `integration_time_map_<run_id>.fit`: seconds per pixel (`BUNIT='s'`), used for measurement and autocropping. Raw second values may saturate an image viewer's default 0-1 display; use the normalized map for viewing.
+- `coverage_map_<run_id>[_<cohort_tag>].fit`: a floating-point 0-1 viewing map. Black means no data; white marks the greatest integration time. Multiply a pixel by the report's `normalization_seconds` to recover seconds.
+- `integration_time_map_<run_id>[_<cohort_tag>].fit`: seconds per pixel (`BUNIT='s'`), used for measurement and autocropping. Raw second values may saturate an image viewer's default 0-1 display; use the normalized map for viewing.
 
 Both maps cover the **entire uncropped master**, independent of the crop percentage. Enable `Create auto-cropped master` to preserve that master and write a second master containing the largest axis-aligned rectangle entirely meeting the minimum integration time. `Crop depth (%)` sets that minimum relative to the median integration time of nonblank pixels, not the deepest panel overlap. The default 50% requires half that typical integration; lower values keep more field, while higher values reject more shallow coverage. This percentage is not the percentage of image area retained. Black corners and internal gaps are excluded, so an irregular footprint can still require sacrificing some usable field to form a clean rectangle. Integration times are before per-pixel rejection and stacking weights, not effective weighted exposure or a direct noise measurement. If any registered frame lacks a finite positive `EXPTIME`, coverage and autocrop are skipped with a warning rather than guessing its contribution.
 
-The maps use Siril's sequence placement data and maximize-framing canvas, and their pixel reduction is streamed through NumPy to avoid loading the full sequence at once. Crop reports record the reference integration time and cutoff in seconds, FITS-array bounds, and converted Siril selection coordinates. Existing crop-percentage profile values now refer to typical integration time rather than peak frame coverage. Coverage cropping currently requires a single substack. Previously generated count maps are not retroactively converted to integration-time maps; an already running process also keeps the code it loaded at startup.
+The maps use Siril's sequence placement data and maximize-framing canvas, and their pixel reduction is streamed through NumPy to avoid loading the full sequence at once. With multiple substacks, each substack map is placed on the final master registration canvas and summed before cropping. Crop reports record the reference integration time and cutoff in seconds, FITS-array bounds, and converted Siril selection coordinates. Existing crop-percentage profile values now refer to typical integration time rather than peak frame coverage. Previously generated count maps are not retroactively converted to integration-time maps; an already running process also keeps the code it loaded at startup.
+
+After a completed run, the GUI's `Cropping Workbench` tab can load the quality report, select a single master or cohort master, preview alternate crop depths, open a larger visual popup with the crop rectangle overlaid on the full master and a stretched selected-region thumbnail, and create a new cropped master from the saved integration-time map. It does not rerun stacking or alter the original master. The same operation is available to scripts with `--crop-workbench` and its master, coverage, percentage, and output arguments.
 
 Set `Test frame count (0 = all)` to randomly sample a smaller number of eligible frames for a quick test. Only the sampled frames are moved and processed; unselected source files remain in place. Use `0` for a normal full run.
 
@@ -141,10 +213,7 @@ python -m pytest -q -k real_pipeline_on_copied_frames
 
 The conversion test uses synthetic mixed-extension FITS with different exposures. The pipeline smoke test copies six 60-second LBN 576 frames into temporary storage and verifies integration, coverage, crop dimensions, and byte-for-byte restoration of the copies. It never stages the original dataset. Close other Siril sessions before these tests. Other cameras, XISF conversion, and multi-substack/drizzle combinations need separate real-data validation.
 
-## Parking Lot
-
-- **Multi-substack integration-time coverage and autocrop:** generate a coverage map for each registered substack, then compose those maps onto the final master canvas using the final substack-registration placements. Run the existing integration-time threshold and largest-rectangle crop algorithm on the composed map. Validate the coordinate transforms and vertical orientation with synthetic pixel-placement tests before enabling it.
-
 ## Source Safety
 
-The application records every moved source frame in `source_manifest.json` and restores it to its original relative path, including in debug mode. It refuses a preexisting `Lights_sorted` directory without cleaning that directory. Debug mode retains generated intermediates for investigation; move or remove those retained products before starting another run. Retries restart failed Siril substack commands from clean generated files, record the failed attempt, and never retry cancellation. Do not manually alter `Lights_sorted` while a run is active. Keeping an independent backup of irreplaceable acquisition data is still recommended.
+The application records every moved source frame in `source_manifest.json` and restores it to its original relative path, including in debug mode. Frames rejected by frame-selection filters are moved into a mirrored `rejects` folder after their substack completes, so they can be inspected separately. When a new run starts, those files are restored to their original paths before input discovery. It refuses a preexisting `Lights_sorted` directory without cleaning that directory. Debug mode retains generated intermediates for investigation; move or remove those retained products before starting another run. Retries restart failed Siril substack commands from clean generated files, record the failed attempt, and never retry cancellation. Do not manually alter `Lights_sorted` or `rejects` while a run is active. Keeping an independent backup of irreplaceable acquisition data is still recommended.
+After each completed substack, the application writes an atomic `run_checkpoint.json`. If a run is interrupted, the GUI's `Resume Run` action or the CLI's `--resume` option validates the checkpoint and configuration, verifies the selected-file manifest including SHA-256 fingerprints for new runs, recovers incomplete staging, reuses completed substack products, and processes only the remaining groups. Per-cohort exports store cohort-local group assignments and completion state, so resume can skip already completed cohorts and continue the interrupted cohort without mixing staging. Use `--run-lock-status` to inspect an active/stale run lock and `--break-run-lock` only after confirming no process is running.
