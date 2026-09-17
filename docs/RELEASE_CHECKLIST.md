@@ -37,6 +37,7 @@ Repeat the test and compile commands in `W:\Astro\_scripts`. Confirm the reposit
 - [ ] No credentials, private paths, or raw data are committed.
 - [ ] Temporary output folders and logs are excluded from the release.
 - [ ] Version text is consistent across README and release notes.
+- [ ] Rebuild `SirilMosaicStacker.exe` with `SirilMosaicStacker.spec` and attach it to the GitHub Release for this tag.
 - [ ] Requirements are installable in a clean environment.
 - [ ] GitHub issue templates are present.
 - [ ] Release archive contains only source, docs, tests, launcher, and required metadata.

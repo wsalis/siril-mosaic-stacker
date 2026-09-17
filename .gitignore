@@ -41,3 +41,7 @@ substack_*.xisf
 *.fts
 *.xisf
 *.seq
+
+# PyInstaller build output
+build/
+dist/

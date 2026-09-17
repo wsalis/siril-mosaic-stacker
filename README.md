@@ -48,6 +48,17 @@ Install Python dependencies:
 py -m pip install -r requirements.txt
 ```
 
+## Windows Executable
+
+Windows users who do not want to install Python can download the standalone `SirilMosaicStacker.exe` from the [Releases](https://github.com/wsalis/siril-mosaic-stacker/releases) page instead of cloning the repository. It still requires a separate Siril installation. Build it yourself from source with:
+
+```powershell
+py -m pip install pyinstaller -r requirements.txt
+py -m PyInstaller --noconfirm --clean SirilMosaicStacker.spec
+```
+
+The executable is written to `dist\SirilMosaicStacker.exe`.
+
 ## Run
 
 Double-click `run_siril_mosaic.bat`, or run:
