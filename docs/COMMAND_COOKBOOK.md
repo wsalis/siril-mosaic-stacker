@@ -73,7 +73,7 @@ P:\python.exe sirilmosaic.py `
   --resume
 ```
 
-Per-cohort exports retain cohort-local checkpoint state, so the same command can skip completed cohorts and continue the interrupted cohort.
+Per-cohort exports retain cohort-local checkpoint state, so the same command can skip completed cohorts and continue the interrupted cohort. The GUI exposes Camera model, Filter, and Exposure time grouping checkboxes; the CLI equivalent repeats `--cohort-group-by`, for example `--cohort-group-by filter --cohort-group-by exposure_seconds`.
 
 ## Inspect Checkpoint and Cleanup Candidates
 
@@ -156,7 +156,7 @@ P:\python.exe sirilmosaic.py `
   --run-lock-status
 ```
 
-Use `--break-run-lock` only after confirming no stacker or Siril process is active. For long runs, the defaults are a 60-second Siril open timeout, a one-hour command timeout, and 0.5 GB minimum free space; override with `--siril-open-timeout`, `--siril-command-timeout`, and `--minimum-free-disk-gb`.
+Use `--break-run-lock` only after confirming no stacker or Siril process is active. For long runs, the defaults are a 60-second Siril open timeout, a four-hour command timeout, and 0.5 GB minimum free space; override with `--siril-open-timeout`, `--siril-command-timeout`, and `--minimum-free-disk-gb`.
 
 ## Crop an Existing Master
 

@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | Windows | Windows 10 or 11 | Primary tested platform. |
 | Python | 3.10 or newer | Tk support is required for the GUI. |
-| Siril | 1.4 or newer | The current test environment uses Siril 1.4.4. |
+| Siril | 1.3.6 or newer | Siril 1.4+ supports 8,192-frame sequences; older supported versions use 2,048. The current test environment uses Siril 1.4.4. |
 | pySiril | 0.0.15 | Required for the command-pipe integration. |
 | FITS | `.fit`, `.fits`, `.fts` | Readable FITS headers and supported image dimensions are required. |
 | XISF | `.xisf` | Conversion and metadata behavior depends on valid XISF metadata. |

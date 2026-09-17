@@ -27,7 +27,7 @@ The report may predate that artifact or the file may have been moved. Use a fres
 
 ## Automatic verification artifact is missing
 
-Run Verification is attempted after a successful pipeline, but verification output is non-fatal so a report can still complete when the verifier cannot read an artifact. Run `--verify-run` against the report to see the failing check, then rerun the command after restoring the missing evidence. `--bundle-report` also creates the verification artifact when an older report does not have one.
+Run Verification is attempted after processing completes. A verification `FAIL`, or an error that prevents verification, returns a nonzero process exit even though completed image artifacts are preserved and the report retains processing status `complete`. Check `verification_status` and `verification_error` in the report, then run `--verify-run` after restoring missing evidence. `--bundle-report` also creates the verification artifact when an older report does not have one.
 
 ## Integrity Scan reports duplicates
 
@@ -54,6 +54,8 @@ Replay requires measured values in a completed frame ledger. A partial run, an o
 Resume requires `run_checkpoint.json` in the selected output folder. A successful run removes it. Choose the same input/output folders and matching processing settings used by the interrupted run.
 
 Use `Checkpoint Status` or `--checkpoint-status` to inspect referenced reports, manifests, ledgers, staged assignments, and completed products. `Discard Checkpoint` removes only the metadata after confirmation; it does not restore or delete staged files.
+
+If `Abandon Run` reports that manifest sources are missing, it first checks for staged frame/process payloads and an active checkpoint. It will refuse to bypass either. When only manifests and empty staging folders remain and no checkpoint exists, it offers a second confirmation to remove that orphan recovery metadata. The missing entries are recorded in the dialog/status message and are not restored or deleted by this action.
 
 ## Resume settings do not match
 

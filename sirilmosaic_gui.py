@@ -43,6 +43,7 @@ from sirilmosaic import (
     REJECTION_FRACTION_METHODS,
     STACK_NORMALIZATION_METHODS,
     PLATE_SOLVE_CATALOGS,
+    InterruptedRunRecoveryError,
     REGISTRATION_INTERPOLATIONS,
     REGISTRATION_TRANSFORMS,
     summarize_frame_cohorts,
@@ -74,6 +75,9 @@ PROFILE_FIELDS = (
     "coverage_map",
     "auto_crop_master",
     "export_per_cohort",
+    "cohort_group_camera",
+    "cohort_group_filter",
+    "cohort_group_exposure",
     "auto_crop_coverage_percent",
     "substacks",
     "auto_substacks",
@@ -134,7 +138,7 @@ SIRIL_PROGRESS = re.compile(r"^\s*progress:\s*([0-9.]+)%", re.IGNORECASE)
 HELP_TEXT = """SIRIL MOSAIC STACKER 1.4
 
 QUICK START
-1. Install Python 3.10+ with Tk support, Siril 1.4+, and the packages in requirements.txt.
+1. Install Python 3.10+ with Tk support, Siril 1.3.6+, and the packages in requirements.txt.
 2. Choose the folder containing your light frames. FITS (.fit, .fits, .fts) and XISF files are found recursively.
 3. Choose a separate output folder and the Siril executable itself.
 4. For a first run, leave Test frame count at 0, use one substack if the sequence is below Siril's limit, and keep drizzle disabled.
@@ -149,7 +153,7 @@ RESUMABLE RUNS
 Completed substacks are checkpointed in run_checkpoint.json. Use Resume Run after an interrupted run to validate the checkpoint, verify input fingerprints, recover incomplete staging, and reuse completed substack products. Per-cohort exports retain separate cohort assignments and completion state. The main action row provides checkpoint inspection, discard, lock status, and stale-lock recovery actions.
 
 INPUTS AND GROUPING
-Input files may be mixed FITS extensions or XISF. Test frame count randomly samples eligible files while leaving unselected files in place. Substacks split the selected files into randomized, non-empty groups before final integration. Auto substacks calculates enough groups to keep each Siril sequence at or below the 8,192-frame Windows limit. More groups require more intermediate storage and currently disable coverage-map autocrop. Integrity scans perform deep FITS payload validation before a preview run.
+Input files may be mixed FITS extensions or XISF. Test frame count randomly samples eligible files while leaving unselected files in place. Substacks split the selected files into randomized, non-empty groups before final integration. Auto substacks detects the selected Siril version and uses its supported sequence limit: 8,192 frames for Siril 1.4+ and 2,048 for older supported versions. More groups require more intermediate storage and currently disable coverage-map autocrop. Integrity scans perform deep FITS payload validation before a preview run.
 
 CFA AND PREPROCESSING
 Bayer pattern controls the CFA color layout; Auto reads headers where possible. CFA row order controls sensor orientation; explicit Top-down or Bottom-up can resolve missing or unreliable ROWORDER metadata. Optional cosmetic correction repairs hot/cold CFA pixels before debayering; higher sigma values are more conservative. Background extraction supports Off, RBF, and Quadratic modes with configurable samples and tolerance.
@@ -178,7 +182,7 @@ PROFILES AND RESOURCES
 Profiles save processing controls and are stored under %APPDATA%\\Siril Mosaic Stacker. The last successfully loaded or saved profile is restored at startup; merely changing the dropdown does not change the remembered profile. Memory fraction, CPU count, retry count, and storage estimates help control resource use. Leave free space for converted, calibrated, registered, and rejection-map products.
 
 ACQUISITION COHORTS
-Preflight and reports group frames by camera, exposure, gain, filter, and dimensions. Enable Export one master per acquisition cohort to process each cohort independently and write numbered cohort masters. When coverage is enabled, each cohort also receives its own coverage maps and optional cropped master.
+When Export one master per acquisition cohort is enabled, choose Camera model, Filter, and Exposure time to define the grouping key. Each selected field is included in the cohort ID; unselected fields may be mixed. Each cohort is processed independently and receives its own master, coverage maps, and optional cropped master.
 
 PLATFORM NOTES
 On Windows, select siril.exe. On macOS, select /Applications/Siril.app/Contents/MacOS/siril. For an ASI533MC with missing ROWORDER metadata, RGGB with Bottom-up is the known-good starting point documented by this project.
@@ -195,7 +199,7 @@ SUBSTACKS
 Substacks is the number of randomized, non-empty groups processed before final integration. One group is simplest for a sequence below Siril's frame limit. More groups can reduce per-sequence memory and frame-count pressure, but require more intermediate storage and a final integration step.
 
 AUTO SUBSTACKS
-Auto substacks calculates the smallest group count that keeps each Siril sequence at or below 8,192 frames. This is useful for large collections and Windows builds with sequence limits. More groups currently make full-mosaic coverage autocrop less direct and increase temporary disk use.
+Auto substacks detects the selected Siril version and calculates the smallest group count that stays within its sequence limit: 8,192 frames for Siril 1.4+ and 2,048 for older supported versions. More groups currently make full-mosaic coverage autocrop less direct and increase temporary disk use.
 
 BAYER PATTERN
 Auto (header) asks Siril to use CFA metadata when available. RGGB, BGGR, GBRG, and GRGR are explicit sensor arrangements; use an explicit value when your files have unreliable or missing Bayer metadata.
@@ -204,7 +208,7 @@ CFA ROW ORDER
 Auto reads the header when possible. Top-down and Bottom-up control the vertical sensor orientation used during debayering. A wrong row order produces incorrect color structure even when the Bayer pattern is right.
 
 ACQUISITION COHORTS
-Export one master per acquisition cohort separates frames by camera, exposure, gain, filter, and dimensions. Each cohort gets its own master/report entries and, when enabled, its own coverage maps and crop output. This prevents unlike acquisition populations from being silently combined.
+Export one master per acquisition cohort separates frames using the selected Camera model, Filter, and Exposure time fields. Each cohort gets its own master/report entries and, when enabled, its own coverage maps and crop output.
 
 PREPROCESSING
 COSMETIC CORRECTION
@@ -314,7 +318,7 @@ VISUAL PREVIEW
 Open Visual Preview shows the full master with the crop rectangle and a stretched selected-region thumbnail. This is useful for rejecting a numerically valid crop that cuts into a target or leaves an awkward composition.
 
 CREATE CROPPED MASTER
-Create Cropped Master runs Siril only for the crop operation and writes a new FITS output. It does not rerun conversion, calibration, registration, or stacking.""",
+Create Cropped Master runs Siril only for the crop operation and writes a new FITS output. It does not rerun conversion, calibration, registration, or stacking. A crop retaining less than 1% of the master area is highlighted and requires confirmation. Crop depth is an integration threshold, not the percentage of area retained.""",
     "Run History": """REPORT ARCHIVE
 Run History scans the selected output folder for quality_report_*.json files and lists status, input, stacked/rejected counts, integrated hours, and verification-artifact availability.
 
@@ -327,7 +331,7 @@ Verify Selected performs the read-only audit. Export Selected Bundle creates the
 Choose FWHM, Roundness, Background, or Stars. The histogram uses values recorded in the frame ledger and displays numeric x-axis ticks, a distribution, and the recorded threshold when available.
 
 READING THE PLOT
-FWHM and Background are generally lower-is-better; Roundness and Stars are generally higher-is-better. A threshold line is a selection boundary from the run's measured registration data, not a universal quality standard.
+The summary states the recorded pass direction. FWHM and Background are generally lower-is-better; Roundness and Stars are generally higher-is-better. When ledger records contain different thresholds, the orange line is labeled as their median and the summary shows the count and range. A threshold is a selection boundary from the run's measured registration data, not a universal quality standard.
 
 ZERO VALUES
 Nonpositive metric values are treated as missing placeholders rather than real measurements. Siril or a sequence record can emit zero when a metric was unavailable for a frame; Quality Explorer excludes those values from the histogram and reports how many were ignored.
@@ -500,6 +504,7 @@ def report_history_summary(report_path: Path, report: dict[str, Any]) -> dict[st
 def quality_metric_summary(records: list[dict[str, Any]], metric: str) -> dict[str, Any]:
     values = []
     thresholds = []
+    comparisons = []
     ignored_nonpositive = 0
     for record in records:
         detail = record.get("filter_metrics", {}).get(metric, {})
@@ -517,12 +522,24 @@ def quality_metric_summary(records: list[dict[str, Any]], metric: str) -> dict[s
             threshold = None
         if threshold is not None and math.isfinite(threshold):
             thresholds.append(threshold)
+        comparison = detail.get("comparison")
+        if comparison in ("<=", ">="):
+            comparisons.append(comparison)
+    comparison = max(set(comparisons), key=comparisons.count) if comparisons else (
+        ">=" if metric in ("roundness", "stars") else "<="
+    )
+    distinct_thresholds = sorted(set(thresholds))
     if not values:
         return {
             "metric": metric,
             "count": 0,
             "values": [],
             "threshold": None,
+            "threshold_count": 0,
+            "distinct_threshold_count": 0,
+            "threshold_minimum": None,
+            "threshold_maximum": None,
+            "comparison": comparison,
             "ignored_nonpositive": ignored_nonpositive,
         }
     return {
@@ -530,12 +547,74 @@ def quality_metric_summary(records: list[dict[str, Any]], metric: str) -> dict[s
         "count": len(values),
         "values": values,
         "threshold": float(np.median(thresholds)) if thresholds else None,
+        "threshold_count": len(thresholds),
+        "distinct_threshold_count": len(distinct_thresholds),
+        "threshold_minimum": min(thresholds) if thresholds else None,
+        "threshold_maximum": max(thresholds) if thresholds else None,
+        "comparison": comparison,
         "minimum": min(values),
         "maximum": max(values),
         "median": float(np.median(values)),
         "mean": float(np.mean(values)),
         "ignored_nonpositive": ignored_nonpositive,
     }
+
+
+def crop_requires_confirmation(plan: dict[str, Any], minimum_area_percent: float = 1.0) -> bool:
+    try:
+        area_percent = float(plan.get('area_percent'))
+    except (TypeError, ValueError):
+        return True
+    return not math.isfinite(area_percent) or area_percent < minimum_area_percent
+
+
+def completion_summary(report: dict[str, Any], report_path: Path | None, log_path: Path | None) -> str:
+    integration = report.get("integration") or {}
+    input_frames = int(report.get("input_frames", 0) or 0)
+    stacked_frames = integration.get("stacked_frames")
+    if stacked_frames is None:
+        stacked_frames = sum(
+            int((item.get("stack") or {}).get("stacked_frames", 0) or 0)
+            for item in (report.get("substacks") or [])
+        )
+    stacked_frames = int(stacked_frames or 0)
+    lines = [
+        "Mosaic stack completed successfully.",
+        "",
+        f"Frames: {stacked_frames} stacked of {input_frames} input "
+        f"({max(input_frames - stacked_frames, 0)} not stacked)",
+    ]
+    integrated_hours = integration.get("integrated_hours")
+    lines.append(
+        f"Integrated data: {float(integrated_hours):.2f} hours"
+        if integrated_hours is not None
+        else "Integrated data: unavailable (see quality report)"
+    )
+    sky_condition = report.get("sky_condition") or {}
+    if sky_condition.get("score") is not None:
+        lines.append(
+            f"Relative filter retention: {float(sky_condition['score']):.1f}/100 "
+            f"({sky_condition.get('classification', 'Unknown')})"
+        )
+    lines.append(f"Verification: {report.get('verification_status', 'not recorded')}")
+
+    masters = report.get("masters") or ([report.get("master")] if report.get("master") else [])
+    coverages = report.get("coverages") or ([report.get("coverage")] if report.get("coverage") else [])
+    master_paths = [str(item["path"]) for item in masters if item and item.get("path")]
+    crop_paths = [str(item["cropped_master_path"]) for item in coverages if item and item.get("cropped_master_path")]
+    lines.append(f"Masters: {len(master_paths)}")
+    if len(master_paths) == 1:
+        lines.append(f"Master: {master_paths[0]}")
+    lines.append(f"Cropped masters: {len(crop_paths)}")
+    if len(crop_paths) == 1:
+        lines.append(f"Crop: {crop_paths[0]}")
+    lines.extend((
+        "",
+        f"Quality report: {report_path}" if report_path is not None else "Quality report: unavailable",
+        f"Log: {log_path}" if log_path is not None else "Log: unavailable",
+        "Run Review is loaded with verification and artifact actions.",
+    ))
+    return "\n".join(lines)
 
 
 def cohort_balance_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -665,6 +744,19 @@ def terminate_siril_descendants(parent_pid: int) -> int:
     return len(targets)
 
 
+def completed_verification_failure(report_path: Path | None) -> str | None:
+    if report_path is None or not report_path.is_file():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+    verification_status = report.get('verification_status')
+    if report.get('status') == 'complete' and verification_status in {'FAIL', 'ERROR'}:
+        return verification_status
+    return None
+
+
 class SirilMosaicApp:
     def __init__(self, root: tk.Tk, profile_path: Path | None = None) -> None:
         self.root = root
@@ -771,6 +863,9 @@ class SirilMosaicApp:
         self.coverage_map = tk.BooleanVar(value=False)
         self.auto_crop_master = tk.BooleanVar(value=False)
         self.export_per_cohort = tk.BooleanVar(value=False)
+        self.cohort_group_camera = tk.BooleanVar(value=True)
+        self.cohort_group_filter = tk.BooleanVar(value=True)
+        self.cohort_group_exposure = tk.BooleanVar(value=True)
         self.auto_crop_coverage_percent = tk.IntVar(value=50)
         self.substacks = tk.IntVar(value=2)
         self.auto_substacks = tk.BooleanVar(value=False)
@@ -831,6 +926,7 @@ class SirilMosaicApp:
         self.substacks_widget: ttk.Spinbox | None = None
         self.star_count_widget: ttk.Spinbox | None = None
         self.coverage_widgets: list[tk.Widget] = []
+        self.cohort_group_widgets: list[tk.Widget] = []
         self.rbf_smoothing_widget: ttk.Spinbox | None = None
         self.background_dither_widget: tk.Widget | None = None
         self.fast_normalization_widget: tk.Widget | None = None
@@ -851,6 +947,7 @@ class SirilMosaicApp:
         self.update_cosmetic_controls()
         self.update_quality_filter_controls()
         self.update_coverage_controls()
+        self.update_cohort_group_controls()
         self.update_background_controls()
         self._build_actions()
         self._build_log()
@@ -925,8 +1022,11 @@ class SirilMosaicApp:
         "Substacks": "Number of randomized non-empty groups processed before final integration. More groups reduce per-sequence load but increase temporary storage and processing overhead.",
         "Bayer pattern": "CFA color arrangement used when debayering. Auto reads the FITS/XISF header; choose an explicit pattern when metadata is missing or unreliable.",
         "CFA row order": "Sensor row orientation used by debayering. Auto reads metadata; Top-down or Bottom-up can correct missing or incorrect ROWORDER headers.",
-        "Auto substacks (max 8192 frames each)": "Automatically chooses the smallest number of groups that keeps each Siril sequence within the Windows 8,192-frame limit.",
-        "Export one master per acquisition cohort": "Splits mixed acquisition populations by camera, exposure, gain, filter, and dimensions, then writes one independently reportable master per cohort.",
+        "Auto substacks (detected Siril limit)": "Detects the selected Siril version and chooses the smallest number of groups that stays within its supported sequence limit: 8,192 frames for Siril 1.4+ or 2,048 for older supported versions.",
+        "Export one master per acquisition cohort": "Writes one master per selected acquisition grouping. Choose Camera model, Filter, and Exposure time on the same line.",
+        "Camera model": "Groups cohort exports by the camera model recorded in frame metadata.",
+        "Filter": "Groups cohort exports by the recorded optical filter when cohort export is enabled.",
+        "Exposure time": "Groups cohort exports by the recorded exposure time in seconds.",
         "Enable cosmetic correction": "Runs CFA cosmetic correction before calibration/debayering to reduce hot and cold pixel defects. It can add processing time and should be validated visually.",
         "Cold-pixel sigma": "Detection threshold for unusually dark CFA pixels. Higher values are more conservative and correct fewer pixels. A value of 50.0 effectively disables cold-pixel correction.",
         "Hot-pixel sigma": "Detection threshold for unusually bright CFA pixels. Lower values correct more candidates but can risk altering real signal. A value of 50.0 effectively disables hot-pixel correction.",
@@ -1455,7 +1555,7 @@ class SirilMosaicApp:
         ).grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=4)
         ttk.Checkbutton(
             capture,
-            text="Auto substacks (max 8192 frames each)",
+            text="Auto substacks (detected Siril limit)",
             variable=self.auto_substacks,
             command=self.update_substack_controls,
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=4)
@@ -1463,8 +1563,19 @@ class SirilMosaicApp:
             capture,
             text="Export one master per acquisition cohort",
             variable=self.export_per_cohort,
-            command=self.update_coverage_controls,
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=4)
+            command=self.update_cohort_group_controls,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+        cohort_group_frame = ttk.Frame(capture)
+        cohort_group_frame.grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
+        for text, variable in (
+            ("Camera model", self.cohort_group_camera),
+            ("Filter", self.cohort_group_filter),
+            ("Exposure time", self.cohort_group_exposure),
+        ):
+            widget = ttk.Checkbutton(cohort_group_frame, text=text, variable=variable)
+            widget.pack(side="left", padx=(0, 8))
+            self.cohort_group_widgets.append(widget)
+        self.update_cohort_group_controls()
 
         cosmetic = section(right_column, "Cosmetic correction", 0)
         ttk.Checkbutton(
@@ -2220,12 +2331,23 @@ class SirilMosaicApp:
             self._set_text(self.quality_summary, f"No measured {self.quality_metric.get()} values in this ledger.")
             return
         self.quality_summary_data = summary
+        if summary["threshold"] is None:
+            threshold_text = "Recorded cutoff: unavailable"
+        elif summary["distinct_threshold_count"] > 1:
+            threshold_text = (
+                f"Orange line: median cutoff {summary['threshold']:.5g} across "
+                f"{summary['threshold_count']} records (range {summary['threshold_minimum']:.5g} "
+                f"to {summary['threshold_maximum']:.5g})"
+            )
+        else:
+            threshold_text = f"Orange line: recorded cutoff {summary['threshold']:.5g}"
         self._set_text(self.quality_summary, "\n".join((
             f"Run: {report.get('run_id', report_path.stem)}",
             f"Metric: {summary['metric']}   measured: {summary['count']}",
             f"Range: {summary['minimum']:.5g} to {summary['maximum']:.5g}   median: {summary['median']:.5g}   mean: {summary['mean']:.5g}",
             f"Ignored nonpositive/unavailable placeholders: {summary.get('ignored_nonpositive', 0)}",
-            f"Recorded threshold: {summary['threshold']:.5g}" if summary["threshold"] is not None else "Recorded threshold: unavailable",
+            f"Pass rule: value {summary['comparison']} cutoff",
+            threshold_text,
         )))
         self._draw_quality_histogram(summary)
 
@@ -2271,10 +2393,15 @@ class SirilMosaicApp:
         if summary["threshold"] is not None and summary["maximum"] > summary["minimum"]:
             x = left + (summary["threshold"] - summary["minimum"]) / (summary["maximum"] - summary["minimum"]) * (right - left)
             canvas.create_line(x, top, x, bottom, fill="#e8a85c", width=2)
-            if x > right - 80:
-                canvas.create_text(min(x - 5, right - 5), top, anchor="ne", text="threshold", fill="#e8a85c")
+            threshold_label = (
+                f"median cutoff ({summary['comparison']})"
+                if summary.get("distinct_threshold_count", 0) > 1
+                else f"cutoff ({summary['comparison']})"
+            )
+            if x > right - 110:
+                canvas.create_text(min(x - 5, right - 5), top, anchor="ne", text=threshold_label, fill="#e8a85c")
             else:
-                canvas.create_text(x + 5, top, anchor="nw", text="threshold", fill="#e8a85c")
+                canvas.create_text(x + 5, top, anchor="nw", text=threshold_label, fill="#e8a85c")
         canvas.create_text((left + right) / 2, height - 10, anchor="s", text=summary["metric"], fill=DARK_TEXT)
         canvas.create_text(12, top - 16, anchor="nw", text="count", fill=DARK_TEXT)
 
@@ -3119,12 +3246,43 @@ class SirilMosaicApp:
             return
         try:
             result = abandon_interrupted_run(workdir, output_dir)
+        except InterruptedRunRecoveryError as error:
+            if not error.orphan_cleanup_allowed:
+                messagebox.showerror(
+                    "Abandon Run",
+                    f"Recovery was not completed; no fresh run was started:\n\n{error}",
+                )
+                return
+            missing_paths = "\n".join(f"  {path}" for path in error.missing_sources)
+            if not messagebox.askyesno(
+                "Abandon Run: Missing Sources",
+                f"{len(error.missing_sources)} manifest-referenced source file(s) are already missing.\n\n"
+                f"{missing_paths}\n\n"
+                "No staged frame/process payloads or checkpoint remain. Remove only the empty recovery state?\n"
+                "The listed files will not be restored, and reports/logs will be retained.",
+            ):
+                return
+            try:
+                result = abandon_interrupted_run(workdir, output_dir, allow_missing=True)
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as cleanup_error:
+                messagebox.showerror(
+                    "Abandon Run",
+                    f"Recovery was not completed; no fresh run was started:\n\n{cleanup_error}",
+                )
+                return
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
             messagebox.showerror("Abandon Run", f"Recovery was not completed; no fresh run was started:\n\n{error}")
             return
-        self.status.set(
-            f"Abandoned run; restored {result['restored']} source file(s). Reports and logs were retained."
-        )
+        if result.get("missing"):
+            self.status.set(
+                f"Abandoned orphaned run; removed empty recovery state. "
+                f"{len(result['missing'])} source file(s) were already missing and were not deleted. "
+                "Reports and logs were retained."
+            )
+        else:
+            self.status.set(
+                f"Abandoned run; restored {result['restored']} source file(s). Reports and logs were retained."
+            )
 
     def show_run_lock_status(self) -> None:
         output_dir = Path(self.output_dir.get().strip()).expanduser()
@@ -3648,6 +3806,10 @@ class SirilMosaicApp:
         self.crop_plan = plan
         bounds = plan["crop_bounds"]
         selection = plan["crop_siril_selection"]
+        retained_warning = (
+            "\nWARNING: This crop retains less than 1% of the master. Review the visual preview before creating it."
+            if crop_requires_confirmation(plan) else ""
+        )
         self._set_crop_summary(
             "CROP PREVIEW\n"
             f"Master: {plan['master_path']}\n"
@@ -3662,6 +3824,7 @@ class SirilMosaicApp:
             f"width={selection['width']}, height={selection['height']}\n"
             f"Output: {output_path}\n"
             f"Pixels retained: {plan['area_percent']:.3f}%"
+            f"{retained_warning}"
         )
         return plan
 
@@ -3731,6 +3894,14 @@ class SirilMosaicApp:
         return None
 
     def _start_crop_from_plan(self, plan: dict[str, Any]) -> None:
+        if crop_requires_confirmation(plan) and not messagebox.askyesno(
+            "Confirm Very Small Crop",
+            f"This crop retains only {plan.get('area_percent', 0):.3f}% of the master area.\n\n"
+            "This can indicate unsuitable coverage geometry or an overly strict crop depth. "
+            "Create it anyway?",
+        ):
+            self.status.set("Crop creation cancelled; preview retained")
+            return
         executable = Path(self.siril_exe.get().strip()).expanduser()
         if not executable.is_file():
             messagebox.showerror("Cropping Workbench", "Choose an existing Siril executable.")
@@ -4113,6 +4284,7 @@ class SirilMosaicApp:
         self.update_cosmetic_controls()
         self.update_quality_filter_controls()
         self.update_coverage_controls()
+        self.update_cohort_group_controls()
         self.update_background_controls()
         self.update_normalization_controls()
         self.last_used_profile = name
@@ -4215,6 +4387,22 @@ class SirilMosaicApp:
         for widget in self.coverage_widgets[1:]:
             widget.configure(state=crop_state)
 
+    def _selected_cohort_group_fields(self) -> tuple[str, ...]:
+        return tuple(
+            field for field, variable in (
+                ("camera", self.cohort_group_camera),
+                ("filter", self.cohort_group_filter),
+                ("exposure_seconds", self.cohort_group_exposure),
+            ) if variable.get()
+        )
+
+    def update_cohort_group_controls(self) -> None:
+        if self.coverage_widgets:
+            self.update_coverage_controls()
+        state = "normal" if self.export_per_cohort.get() else "disabled"
+        for widget in self.cohort_group_widgets:
+            widget.configure(state=state)
+
     def update_background_controls(self) -> None:
         method = self.background_method.get()
         state = "disabled" if method == "Off" else "normal"
@@ -4254,6 +4442,8 @@ class SirilMosaicApp:
             raise ValueError("Choose an existing Siril executable.")
         if not allow_resume and not self.auto_substacks.get() and not 1 <= self.substacks.get() <= frame_count:
             raise ValueError("Substacks must be between 1 and the number of input frames.")
+        if self.export_per_cohort.get() and not self._selected_cohort_group_fields():
+            raise ValueError("Select at least one cohort grouping field.")
         if self.auto_crop_master.get() and not self.coverage_map.get():
             raise ValueError("Auto-cropped master requires Write coverage map.")
         if not 1 <= self.auto_crop_coverage_percent.get() <= 100:
@@ -4380,6 +4570,9 @@ class SirilMosaicApp:
             "--auto-crop-coverage-percent", str(self.auto_crop_coverage_percent.get()),
             "--export-per-cohort" if self.export_per_cohort.get() else "--no-export-per-cohort",
         ]
+        if self.export_per_cohort.get():
+            for field in self._selected_cohort_group_fields():
+                command.extend(("--cohort-group-by", field))
         if self.plate_solve_radius.get().strip():
             command.extend(("--plate-solve-radius", self.plate_solve_radius.get().strip()))
         if self.plate_solve_limit_mag.get().strip():
@@ -4465,7 +4658,7 @@ class SirilMosaicApp:
 
     def _cohort_summary(self, workdir: Path, output_dir: Path) -> str:
         files = self._input_files_after_reject_restore(workdir, output_dir)
-        cohorts = summarize_frame_cohorts(files)
+        cohorts = summarize_frame_cohorts(files, self._selected_cohort_group_fields())
         lines = [f"Acquisition cohorts: {len(cohorts)}"]
         for cohort in cohorts[:12]:
             lines.append(f"- {cohort['count']} frames: {cohort['id']}")
@@ -4878,6 +5071,9 @@ class SirilMosaicApp:
                     self.resume_button.configure(state="normal")
                     self.cancel_button.configure(state="disabled")
                     self.refresh_run_review()
+                    verification_failure = completed_verification_failure(
+                        self.quality_report_path
+                    )
                     if payload == 2:
                         self.status.set("Cancelled; source files restored")
                         self.progress_estimator.phase = "Cancelled"
@@ -4890,37 +5086,33 @@ class SirilMosaicApp:
                         self.progress_estimator.complete()
                         self.update_progress_display()
                         self.status.set("Complete")
-                        integration_message = ""
+                        report = {}
                         if self.quality_report_path is not None and self.quality_report_path.is_file():
                             try:
                                 report = json.loads(
                                     self.quality_report_path.read_text(encoding="utf-8")
                                 )
-                                integration = report.get("integration", {})
-                                if integration.get("integrated_hours") is not None:
-                                    integration_message = (
-                                        f"\nIntegrated data: "
-                                        f"{integration['integrated_hours']:.2f} hours"
-                                    )
-                                else:
-                                    integration_message = "\nIntegrated data: unavailable (see quality report)"
-                                sky_condition = report.get("sky_condition", {})
-                                if sky_condition.get("score") is not None:
-                                    integration_message += (
-                                        f"\nRelative filter retention: "
-                                        f"{sky_condition['score']:.1f}/100 "
-                                        f"({sky_condition.get('classification', 'Unknown')})"
-                                    )
                             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                                 pass
-                        report_message = (
-                            f"\nQuality report: {self.quality_report_path}"
-                            if self.quality_report_path is not None else ""
-                        )
                         messagebox.showinfo(
                             "Siril Mosaic Stacker",
-                            f"Mosaic stack completed successfully.{integration_message}"
-                            f"\n\nLog: {self.log_path}{report_message}",
+                            completion_summary(report, self.quality_report_path, self.log_path),
+                        )
+                    elif verification_failure:
+                        self.progress_estimator.complete()
+                        self.update_progress_display()
+                        self.status.set(f"Complete; verification {verification_failure.lower()}")
+                        checkpoint = (
+                            Path(self.output_dir.get().strip()).expanduser()
+                            / 'run_checkpoint.json'
+                        )
+                        if not checkpoint.is_file():
+                            self.resume_button.configure(state='disabled')
+                        messagebox.showerror(
+                            "Siril Mosaic Stacker",
+                            "Processing completed and artifacts were preserved, but final "
+                            f"verification reported {verification_failure}.\n\n"
+                            f"Review: {self.quality_report_path}\nLog: {self.log_path}",
                         )
                     else:
                         self.status.set(f"Failed (exit code {payload})")

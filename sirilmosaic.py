@@ -13,6 +13,7 @@ import shutil
 import struct
 import tempfile
 import threading
+import traceback
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -58,7 +59,14 @@ REJECTS_DIRECTORY = 'rejects'
 RUN_CHECKPOINT = 'run_checkpoint.json'
 RUN_LOCK = 'run.lock'
 INTEGRITY_SCAN_VERSION = 1
+MAX_SIRIL_ARTIFACT_PATH = 150
 SUPPORTED_CHECKPOINT_SCHEMAS = {1, 2}
+CHECKPOINT_PHASES = {
+    'pending', 'substacks_running', 'master_written', 'maps_written',
+    'crop_pending', 'skipped', 'complete', 'interrupted',
+}
+FINALIZATION_PHASES = {'master_written', 'maps_written', 'crop_pending', 'complete'}
+LEGACY_CHECKPOINT_PHASES = {'running': 'substacks_running'}
 STACKING_WEIGHTS = {'noise', 'wfwhm', 'nbstars', 'nbstack'}
 STACK_NORMALIZATION_METHODS = ('add', 'mul', 'addscale', 'mulscale')
 PLATE_SOLVE_CATALOGS = ('localgaia', 'tycho2', 'nomad', 'gaia', 'ppmxl', 'brightstars', 'apass')
@@ -69,7 +77,9 @@ PIXEL_REJECTION_METHODS = (
     'none', 'percentile', 'sigma', 'mad', 'median', 'linear', 'winsorized', 'generalized'
 )
 REJECTION_FRACTION_METHODS = {'percentile', 'generalized'}
+SIRIL_LEGACY_MAX_STACK_FRAMES = 2048
 SIRIL_MAX_STACK_FRAMES = 8192
+SIRIL_8192_FRAME_VERSION = (1, 4, 0)
 BAYER_PATTERNS = {'auto': 0, 'RGGB': 0, 'BGGR': 1, 'GBRG': 2, 'GRBG': 3}
 BAYER_ORIENTATIONS = {'auto': 0, 'top-down': 2, 'bottom-up': 3}
 BACKGROUND_METHODS = {'off': None, 'linear': '1', 'quadratic': '2', 'rbf': '-rbf'}
@@ -127,8 +137,11 @@ catalog = 'localgaia'
 memory_fraction = '0.8'
 cpu_count = 28
 siril_open_timeout = 60.0
-siril_command_timeout = 3600.0
+siril_command_timeout = 14400.0
 siril_unresponsive = False
+siril_version_text = 'unavailable'
+siril_version_tuple = None
+siril_max_stack_frames = SIRIL_LEGACY_MAX_STACK_FRAMES
 minimum_free_disk_gb = 0.5
 max_retries = 5
 skip_failed_frames = False
@@ -139,6 +152,8 @@ coverage_map_enabled = False
 auto_crop_enabled = False
 auto_crop_coverage_percent = 50
 export_per_cohort = False
+COHORT_GROUP_FIELDS = ('camera', 'filter', 'exposure_seconds')
+cohort_group_fields = COHORT_GROUP_FIELDS
 sky_quality_percent = 100
 # ==============================================
 
@@ -210,6 +225,20 @@ def detect_siril_version():
         if output:
             return output.splitlines()[0]
     return 'unavailable'
+
+
+def parse_siril_version(version_text):
+    match = re.search(r'(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?', str(version_text))
+    if match is None:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def siril_frame_limit_for_version(version_text):
+    version = parse_siril_version(version_text)
+    if version is not None and version >= SIRIL_8192_FRAME_VERSION:
+        return SIRIL_MAX_STACK_FRAMES
+    return SIRIL_LEGACY_MAX_STACK_FRAMES
 
 def _is_within(path, folder):
     try:
@@ -411,33 +440,63 @@ def frame_cohort_key(path):
     }
 
 
-def summarize_frame_cohorts(files):
+def _cohort_id(key, group_fields=None):
+    fields = COHORT_GROUP_FIELDS if group_fields is None else tuple(group_fields)
+    if not fields:
+        return 'all_frames'
+    return ' | '.join(f'{name}={key[name]}' for name in fields)
+
+
+def summarize_frame_cohorts(files, group_fields=None):
     cohorts = {}
     for path in files:
         key = frame_cohort_key(path)
-        cohort_id = ' | '.join(
-            f'{name}={key[name]}'
-            for name in ('camera', 'exposure_seconds', 'gain', 'filter', 'dimensions')
-        )
-        entry = cohorts.setdefault(cohort_id, {'id': cohort_id, 'count': 0, 'metadata': key})
+        cohort_id = _cohort_id(key, group_fields)
+        entry = cohorts.setdefault(cohort_id, {
+            'id': cohort_id,
+            'count': 0,
+            'metadata_values': {name: set() for name in key},
+        })
         entry['count'] += 1
+        for name, value in key.items():
+            entry['metadata_values'][name].add(value)
+    for entry in cohorts.values():
+        values_by_name = entry['metadata_values']
+        entry['metadata_values'] = {
+            name: sorted(values) for name, values in values_by_name.items()
+        }
+        entry['metadata'] = {
+            name: _summarize_metadata_values(name, values)
+            for name, values in entry['metadata_values'].items()
+        }
     return sorted(cohorts.values(), key=lambda item: (-item['count'], item['id']))
 
 
-def partition_frame_cohorts(files):
+def partition_frame_cohorts(files, group_fields=None):
     cohorts = {}
     for path in files:
         key = frame_cohort_key(path)
-        cohort_id = ' | '.join(
-            f'{name}={key[name]}'
-            for name in ('camera', 'exposure_seconds', 'gain', 'filter', 'dimensions')
-        )
+        cohort_id = _cohort_id(key, group_fields)
         cohorts.setdefault(cohort_id, []).append(path)
     return sorted(cohorts.items(), key=lambda item: (-len(item[1]), item[0]))
 
 
-def cohort_filename_tag(path):
-    key = frame_cohort_key(path)
+def _summarize_metadata_values(name, values):
+    values = sorted({str(value) for value in values})
+    if len(values) == 1:
+        return values[0]
+    if name == 'exposure_seconds':
+        try:
+            numbers = sorted(float(value) for value in values)
+        except ValueError:
+            pass
+        else:
+            return f'mixed-{numbers[0]:g}-{numbers[-1]:g}'
+    return 'mixed'
+
+
+def cohort_filename_tag(source, directory=None, run_identifier=None):
+    key = source if isinstance(source, dict) else frame_cohort_key(source)
 
     def token(value):
         value = str(value).strip()
@@ -446,13 +505,38 @@ def cohort_filename_tag(path):
         value = re.sub(r'[^A-Za-z0-9._-]+', '_', value)
         return value.strip('._-')[:40] or 'unknown'
 
-    return '_'.join((
+    parts = (
         f"camera-{token(key['camera'])}",
         f"exp-{token(key['exposure_seconds'])}s",
         f"gain-{token(key['gain'])}",
         f"filter-{token(key['filter'])}",
         f"size-{token(key['dimensions'])}",
-    ))
+    )
+    tag = '_'.join(parts)
+    if directory is None:
+        return tag
+    identifier = str(run_identifier or run_id)
+    fixed_names = (
+        f'master_stack_{identifier}_cohort_000__cropped.fit',
+        f'integration_time_map_{identifier}_cohort_000_.fit',
+    )
+    tag_budget = MAX_SIRIL_ARTIFACT_PATH - len(str(Path(directory))) - 1 - max(
+        len(name) for name in fixed_names
+    )
+    if tag_budget < 13:
+        raise ValueError(
+            f'Output directory is too long for Siril artifact paths: {directory}'
+        )
+    if len(tag) > tag_budget:
+        digest = hashlib.sha256(tag.encode('utf-8')).hexdigest()[:10]
+        metadata_suffix = '_'.join(parts[1:])
+        camera_budget = tag_budget - len(metadata_suffix) - 1
+        if camera_budget >= 13:
+            camera = f"{parts[0][:camera_budget - 11].rstrip('._-')}-{digest}"
+            tag = f'{camera}_{metadata_suffix}'
+        else:
+            tag = f"{tag[:tag_budget - 11].rstrip('._-')}-{digest}"
+    return tag
 
 
 def remove_tree(path, attempts=8):
@@ -541,7 +625,7 @@ def move_replace(source, destination):
     os.replace(str(source), str(destination))
 
 
-def group_files(root_folder, files=None):
+def group_files(root_folder, files=None, shuffle_files=True):
     check_cancellation()
     source_folder = root_folder
     destination_folder = root_folder / "Lights_sorted"
@@ -557,7 +641,8 @@ def group_files(root_folder, files=None):
         file_end=file_offset + len(files),
         file_total=file_total,
     )
-    random.shuffle(files)
+    if shuffle_files:
+        random.shuffle(files)
     group_size, remainder = divmod(len(files), SubStack_nb)
     offset = 0
     for folder_index in range(1, SubStack_nb + 1):
@@ -605,6 +690,26 @@ def read_group_manifests(root_folder, group_numbers):
     return manifests
 
 
+def divide_group_assignments(relative_files, substack_count):
+    if substack_count < 1:
+        raise ValueError('Substack count must be at least one.')
+    group_size, remainder = divmod(len(relative_files), substack_count)
+    groups = {}
+    offset = 0
+    for group_number in range(1, substack_count + 1):
+        count = group_size + (group_number <= remainder)
+        groups[str(group_number)] = list(relative_files[offset:offset + count])
+        offset += count
+    return groups
+
+
+def plan_group_assignments(files, root_folder, substack_count):
+    planned_files = list(files)
+    random.shuffle(planned_files)
+    relative_files = [path.relative_to(root_folder).as_posix() for path in planned_files]
+    return divide_group_assignments(relative_files, substack_count)
+
+
 def restore_staged_group_sources(group_number):
     group_path = workdir / 'Lights_sorted' / f'group_{group_number}'
     manifest_path = group_path / SOURCE_MANIFEST
@@ -630,18 +735,36 @@ def restore_staged_group_sources(group_number):
             )
 
 
-def abandon_interrupted_run(workdir_path, output_dir_path):
+class InterruptedRunRecoveryError(RuntimeError):
+    def __init__(self, message, missing_sources=(), orphan_cleanup_allowed=False):
+        super().__init__(message)
+        self.missing_sources = tuple(missing_sources)
+        self.orphan_cleanup_allowed = orphan_cleanup_allowed
+
+
+def abandon_interrupted_run(workdir_path, output_dir_path, allow_missing=False):
     workdir_path = Path(workdir_path).expanduser().resolve()
     output_dir_path = Path(output_dir_path).expanduser().resolve()
     staging_root = workdir_path / 'Lights_sorted'
     checkpoint_path = output_dir_path / RUN_CHECKPOINT
     if not staging_root.exists() and not checkpoint_path.is_file():
-        return {'restored': 0, 'removed_staging': False, 'removed_checkpoint': False}
+        return {
+            'restored': 0,
+            'missing': [],
+            'removed_staging': False,
+            'removed_checkpoint': False,
+        }
     if staging_root.exists() and not staging_root.is_dir():
         raise RuntimeError(f'Cannot abandon run because staging path is not a folder: {staging_root}')
 
     moves = []
+    missing_sources = []
+    staging_payloads = []
     if staging_root.is_dir():
+        staging_payloads = [
+            path for path in staging_root.rglob('*')
+            if path.is_file() and path.name != SOURCE_MANIFEST
+        ]
         group_paths = sorted(path for path in staging_root.glob('group_*') if path.is_dir())
         for group_path in group_paths:
             manifest_path = group_path / SOURCE_MANIFEST
@@ -667,9 +790,21 @@ def abandon_interrupted_run(workdir_path, output_dir_path):
                         )
                     moves.append((source, destination))
                 elif not destination.is_file() and not rejected.is_file():
-                    raise RuntimeError(
-                        f'Staged source is missing from staging, source, and rejects: {relative_path}'
-                    )
+                    missing_sources.append(str(relative_path))
+    if missing_sources and not allow_missing:
+        sample = ', '.join(missing_sources[:3])
+        suffix = '...' if len(missing_sources) > 3 else ''
+        raise InterruptedRunRecoveryError(
+            f'{len(missing_sources)} staged source file(s) are missing from staging, source, and rejects: '
+            f'{sample}{suffix}',
+            missing_sources,
+            orphan_cleanup_allowed=not checkpoint_path.is_file() and not staging_payloads,
+        )
+    if allow_missing and missing_sources:
+        if checkpoint_path.is_file():
+            raise RuntimeError('Cannot clear orphaned recovery state while a checkpoint is still present.')
+        if staging_payloads:
+            raise RuntimeError('Cannot clear orphaned recovery state while staged payload files are present.')
     for source, destination in moves:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(destination))
@@ -679,6 +814,7 @@ def abandon_interrupted_run(workdir_path, output_dir_path):
     checkpoint_path.unlink(missing_ok=True)
     return {
         'restored': len(moves),
+        'missing': missing_sources,
         'removed_staging': True,
         'removed_checkpoint': checkpoint_path.exists() is False,
     }
@@ -712,6 +848,13 @@ def prepare_resume_staging(checkpoint):
         group_path = lights_sorted / f'group_{group_number}'
         if group_number in completed:
             artifact = group_path / f'substack_{group_number}.fit'
+            moved_artifact = workdir / 'substacks' / 'lights' / artifact.name
+            if not artifact.is_file() and moved_artifact.is_file():
+                group_path.mkdir(parents=True, exist_ok=True)
+                move_replace(moved_artifact, artifact)
+                moved_maps = workdir / 'substacks' / 'rejection_maps'
+                for rejection_map in moved_maps.glob(f'substack_{group_number}_*rejmap.fit'):
+                    move_replace(rejection_map, group_path / rejection_map.name)
             if not artifact.is_file():
                 raise RuntimeError(
                     f'Completed resume substack artifact is missing: {artifact}'
@@ -749,6 +892,15 @@ def cleanup(group_num, restore_sources=None):
                 shutil.move(str(source), str(destination))
             elif not destination.is_file():
                 raise RuntimeError(f"Source frame is missing from staging and its original path: {source}")
+
+
+def restore_staged_cohort_sources():
+    for group_number in range(1, SubStack_nb + 1):
+        group_path = workdir / 'Lights_sorted' / f'group_{group_number}'
+        if group_path.is_dir():
+            cleanup(group_number, restore_sources=True)
+    remove_tree(workdir / 'Lights_sorted')
+    remove_tree(workdir / 'substacks')
 
 
 def move_frame_selection_rejects(discarded_frames):
@@ -795,6 +947,14 @@ def move_frame_selection_rejects(discarded_frames):
 
 class SirilCommandError(RuntimeError):
     pass
+
+
+class NoPlateSolveFramesError(SirilCommandError):
+    def __init__(self, command, response):
+        self.command = command
+        self.response = tuple(response)
+        details = "\n".join(line for line in response if str(line).strip())
+        super().__init__(f"No images successfully plate-solved for {command}.\n{details}")
 
 
 def terminate_siril_processes(parent_pid=None):
@@ -890,6 +1050,32 @@ def _is_siril_pipe_failure(error):
     ))
 
 
+def _plate_solve_success_count(command, response):
+    if not command.casefold().startswith('seqplatesolve '):
+        return None
+    text = '\n'.join(response).casefold()
+    match = re.search(r'(\d+)\s+images?\s+successfully\s+platesolved\s+out\s+of', text)
+    return int(match.group(1)) if match else None
+
+
+def _is_partial_plate_solve(command, response):
+    if not command.casefold().startswith('seqplatesolve ') or not skip_failed_frames:
+        return False
+    text = '\n'.join(response).casefold()
+    return (
+        'sequence processing partially succeeded' in text
+        and (_plate_solve_success_count(command, response) or 0) > 0
+    )
+
+
+def _is_all_failed_plate_solve(command, response):
+    return (
+        skip_failed_frames
+        and command.casefold().startswith('seqplatesolve ')
+        and _plate_solve_success_count(command, response) == 0
+    )
+
+
 def open_siril_with_recovery(siril_factory):
     global app, siril_unresponsive
     try:
@@ -942,7 +1128,7 @@ def _run_siril_call(callback, label, timeout):
     return result.get('value')
 
 
-def execute_siril(command):
+def execute_siril(command, allow_partial=False):
     global command_sequence
     check_cancellation()
     siril_app = app
@@ -969,12 +1155,31 @@ def execute_siril(command):
         response = [str(line) for line in data] if isinstance(data, (list, tuple)) else []
         check_cancellation()
         if not succeeded:
+            if allow_partial:
+                if _is_all_failed_plate_solve(command, response):
+                    status = 'no_usable_frames'
+                    print(
+                        '[WARNING] Siril plate-solved zero frames; '
+                        'the current cohort will be handled as unusable.',
+                        flush=True,
+                    )
+                    raise NoPlateSolveFramesError(command, response)
+                if _is_partial_plate_solve(command, response):
+                    status = 'partial'
+                    print(
+                        '[WARNING] Siril reported partial plate-solving success; '
+                        'continuing with the successfully solved frames.',
+                        flush=True,
+                    )
+                    return response
             details = "\n".join(line for line in response if line.strip())
             raise RuntimeError(f"Siril command failed: {command}\n{details}")
         status = 'complete'
         return response
     except CancellationRequested:
         status = 'cancelled'
+        raise
+    except SirilCommandError:
         raise
     except Exception as error:
         raise SirilCommandError(str(error)) from error
@@ -990,7 +1195,7 @@ def execute_siril(command):
                 'phase': active_phase,
                 'response_tail': response[-20:],
             })
-            if status != 'complete':
+            if status not in {'complete', 'partial'}:
                 quality_report['last_failed_command'] = command
                 quality_report['siril_response_tail'] = response[-20:]
                 failures = quality_report.setdefault('frame_failures', [])
@@ -1127,6 +1332,26 @@ def write_run_checkpoint(checkpoint):
     _atomic_write_text(run_checkpoint_file_path(), json.dumps(checkpoint, indent=2))
 
 
+def normalize_run_checkpoint(checkpoint):
+    normalized = json.loads(json.dumps(checkpoint))
+    schema_version = normalized.get('schema_version')
+    if schema_version not in SUPPORTED_CHECKPOINT_SCHEMAS:
+        raise RuntimeError(f'Unsupported resume checkpoint schema: {schema_version}')
+    cohorts = normalized.get('cohorts')
+    if schema_version == 2 and not isinstance(cohorts, list):
+        raise RuntimeError('Checkpoint schema 2 is missing cohort resume state.')
+    state = normalized.get('state', 'interrupted')
+    normalized.setdefault('global_phase', LEGACY_CHECKPOINT_PHASES.get(state, state))
+    if normalized['global_phase'] not in CHECKPOINT_PHASES:
+        raise RuntimeError(f'Unsupported resume checkpoint phase: {normalized["global_phase"]}')
+    for cohort in cohorts or []:
+        cohort_state = cohort.get('state', 'pending')
+        cohort.setdefault('phase', LEGACY_CHECKPOINT_PHASES.get(cohort_state, cohort_state))
+        if cohort['phase'] not in CHECKPOINT_PHASES:
+            raise RuntimeError(f'Unsupported cohort checkpoint phase: {cohort["phase"]}')
+    return normalized
+
+
 def load_run_checkpoint(path=None):
     source = Path(path) if path is not None else run_checkpoint_file_path()
     if not source.is_file():
@@ -1135,12 +1360,7 @@ def load_run_checkpoint(path=None):
         checkpoint = json.loads(source.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f'Could not read resume checkpoint: {source} ({error})') from error
-    schema_version = checkpoint.get('schema_version')
-    if schema_version not in SUPPORTED_CHECKPOINT_SCHEMAS:
-        raise RuntimeError(f'Unsupported resume checkpoint schema: {checkpoint.get("schema_version")}')
-    if schema_version == 2 and not isinstance(checkpoint.get('cohorts'), list):
-        raise RuntimeError('Checkpoint schema 2 is missing cohort resume state.')
-    return checkpoint
+    return normalize_run_checkpoint(checkpoint)
 
 
 def remove_run_checkpoint():
@@ -1222,6 +1442,32 @@ def verify_run(report_path):
         'PASS' if isinstance(schema, int) and schema >= 3 else 'WARN',
         f'Report schema version: {schema or "unknown"}.',
     )
+
+    inventory = report.get('artifact_inventory')
+    if inventory is None:
+        add_check(
+            'artifact_inventory', 'PASS',
+            'Legacy compatibility mode: generated-artifact fingerprints were not recorded.',
+        )
+    else:
+        inventory_ok = True
+        details = []
+        for entry in inventory:
+            path = _verification_path(report_path, entry.get('path'))
+            if path is None or not path.is_file():
+                inventory_ok = False
+                details.append(f'{entry.get("role", "artifact")}: missing')
+                continue
+            matches = (
+                path.stat().st_size == entry.get('bytes')
+                and _sha256_file(path) == entry.get('sha256')
+            )
+            inventory_ok &= matches
+            details.append(f'{entry.get("role", "artifact")}: {"match" if matches else "mismatch"}')
+        add_check(
+            'artifact_inventory', 'PASS' if inventory_ok and inventory else 'FAIL',
+            '; '.join(details) if details else 'No generated artifacts were inventoried.',
+        )
 
     journal_path = require_file('run_journal', report.get('journal_path'))
     if journal_path is not None and journal_path.is_file():
@@ -1314,6 +1560,35 @@ def verify_run(report_path):
     artifact_entries = []
     masters = report.get('masters') or []
     coverages = report.get('coverages') or []
+    if report.get('settings', {}).get('export_per_cohort'):
+        expected_cohorts = {
+            cohort.get('id') for cohort in report.get('cohorts', []) if cohort.get('id')
+        }
+        skipped_cohorts = {
+            cohort.get('cohort')
+            for cohort in report.get('skipped_cohorts', []) if cohort.get('cohort')
+        }
+        expected_cohorts -= skipped_cohorts
+
+        def verify_cohort_records(name, records):
+            record_ids = [record.get('cohort') for record in records]
+            present_ids = {cohort_id for cohort_id in record_ids if cohort_id}
+            duplicates = sorted({
+                cohort_id for cohort_id in present_ids if record_ids.count(cohort_id) > 1
+            })
+            missing = sorted(expected_cohorts - present_ids)
+            unexpected = sorted(present_ids - expected_cohorts)
+            valid = not missing and not duplicates and not unexpected
+            add_check(
+                name,
+                'PASS' if valid else 'FAIL',
+                f'{len(records)} record(s) for {len(expected_cohorts)} expected cohort(s); '
+                f'missing={missing}, duplicates={duplicates}, unexpected={unexpected}.',
+            )
+
+        verify_cohort_records('cohort_master_records', masters)
+        if report.get('settings', {}).get('coverage_map'):
+            verify_cohort_records('cohort_coverage_records', coverages)
     if masters:
         for index, master in enumerate(masters):
             cohort = master.get('cohort')
@@ -1366,6 +1641,14 @@ def verify_run(report_path):
                         f'Cropped master {cropped_width}x{cropped_height}; '
                         f'master {master_width}x{master_height}.',
                     )
+                    retained_area = (
+                        cropped_width * cropped_height / (master_width * master_height)
+                    )
+                    add_check(
+                        f'{label}_crop_retained_area',
+                        'PASS' if retained_area >= 0.01 else 'WARN',
+                        f'Cropped master retains {retained_area:.2%} of the master area.',
+                    )
                 except (OSError, ValueError) as error:
                     add_check(f'{label}_crop_dimensions', 'FAIL', str(error))
         elif report.get('settings', {}).get('auto_crop_master'):
@@ -1416,15 +1699,24 @@ def verify_run(report_path):
 
         rejected_records = report.get('rejected_files', [])
         missing_rejects = []
+        rejects_present = 0
+        rejects_restored = 0
         for record in rejected_records:
             relative = Path(str(record.get('path', '')))
-            if relative.is_absolute() or '..' in relative.parts or not (rejects_directory / relative).is_file():
+            if relative.is_absolute() or '..' in relative.parts:
+                missing_rejects.append(str(relative))
+                continue
+            if (rejects_directory / relative).is_file():
+                rejects_present += 1
+            elif (rejects_directory.parent / relative).is_file():
+                rejects_restored += 1
+            else:
                 missing_rejects.append(str(relative))
         add_check(
             'rejected_file_agreement',
             'PASS' if not missing_rejects else 'FAIL',
-            f'{len(rejected_records) - len(missing_rejects)} of {len(rejected_records)} '
-            f'reported reject(s) exist in the rejects directory.',
+            f'{rejects_present} reported reject(s) are in the rejects directory; '
+            f'{rejects_restored} were restored to source; {len(missing_rejects)} are missing.',
         )
 
     substacks = report.get('substacks', [])
@@ -1699,10 +1991,12 @@ def runtime_settings():
         'coverage_map': coverage_map_enabled,
         'auto_crop_master': auto_crop_enabled,
         'export_per_cohort': export_per_cohort,
+        'cohort_group_fields': list(cohort_group_fields),
         'auto_crop_coverage_percent': auto_crop_coverage_percent,
         'substacks': SubStack_nb,
         'auto_substacks': auto_substacks,
-        'max_frames_per_substack': SIRIL_MAX_STACK_FRAMES,
+        'max_frames_per_substack': siril_max_stack_frames,
+        'siril_version': siril_version_text,
         'drizzle': drizzle_enabled,
         'drizzle_scale': drizzle_scale,
         'pixel_fraction': pix_frac,
@@ -1755,8 +2049,48 @@ def runtime_settings():
     }
 
 
+def apply_runtime_settings(settings):
+    setting_globals = {
+        'test_frame_count': 'test_frame_count', 'coverage_map': 'coverage_map_enabled',
+        'auto_crop_master': 'auto_crop_enabled', 'export_per_cohort': 'export_per_cohort',
+        'auto_crop_coverage_percent': 'auto_crop_coverage_percent', 'substacks': 'SubStack_nb',
+        'auto_substacks': 'auto_substacks', 'drizzle': 'drizzle_enabled',
+        'drizzle_scale': 'drizzle_scale', 'pixel_fraction': 'pix_frac',
+        'drizzle_kernel': 'drizzle_kernel', 'bayer_pattern': 'bayer_pattern',
+        'bayer_orientation': 'bayer_orientation', 'cosmetic_correction': 'cosmetic_correction',
+        'cosmetic_cold_sigma': 'cosmetic_cold_sigma', 'cosmetic_hot_sigma': 'cosmetic_hot_sigma',
+        'overlap_normalization': 'overlap_normalization', 'stack_normalization': 'stack_normalization',
+        'plate_solve_order': 'plate_solve_order', 'plate_solve_downscale': 'plate_solve_downscale',
+        'plate_solve_radius': 'plate_solve_radius', 'plate_solve_limit_mag': 'plate_solve_limit_mag',
+        'rbf_smoothing': 'rbf_smoothing', 'background_dither': 'background_dither',
+        'registration_transform': 'registration_transform', 'registration_minpairs': 'registration_minpairs',
+        'registration_maxstars': 'registration_maxstars', 'registration_interpolation': 'registration_interpolation',
+        'filter_background': 'filter_bkg', 'filter_stars': 'filter_nbstars',
+        'filter_roundness': 'filter_round', 'filter_fwhm': 'filter_fwhm',
+        'adaptive_quality_filtering': 'adaptive_quality_filtering', 'quality_filter_sigma': 'quality_filter_sigma',
+        'background_method': 'background_method', 'background_samples': 'background_samples',
+        'background_tolerance': 'background_tolerance', 'stacking_weight': 'stacking_weight',
+        'feather': 'feather_val', 'rejection_low': 'rej_low', 'rejection_high': 'rej_high',
+        'pixel_rejection_method': 'pixel_rejection_method', 'fast_normalization': 'fast_normalization',
+        'skip_failed_frames': 'skip_failed_frames', 'mosaic_aware_star_count': 'mosaic_aware_star_count',
+        'sky_quality_percent': 'sky_quality_percent', 'catalog': 'catalog',
+        'memory_fraction': 'memory_fraction', 'cpu_count': 'cpu_count',
+        'siril_open_timeout': 'siril_open_timeout', 'siril_command_timeout': 'siril_command_timeout',
+        'minimum_free_disk_gb': 'minimum_free_disk_gb', 'max_retries': 'max_retries',
+    }
+    for setting_name, global_name in setting_globals.items():
+        if setting_name in settings:
+            globals()[global_name] = settings[setting_name]
+    if 'cohort_group_fields' in settings:
+        globals()['cohort_group_fields'] = tuple(settings['cohort_group_fields'])
+    if 'seed' in settings:
+        globals()['run_seed'] = settings['seed']
+
+
 def configuration_hash(settings=None):
-    payload = json.dumps(settings or runtime_settings(), sort_keys=True, default=str)
+    settings_payload = dict(settings or runtime_settings())
+    settings_payload.pop('siril_version', None)
+    payload = json.dumps(settings_payload, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
@@ -2399,13 +2733,61 @@ def initialize_quality_report(input_frames):
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "siril_executable": str(siril_exe),
-            "siril_version": detect_siril_version(),
+            "siril_version": siril_version_text,
+            "siril_max_stack_frames": siril_max_stack_frames,
             "siril_requires": "1.3.6",
         },
         "restored_rejected_files": [],
         "rejected_files": [],
             "substacks": [],
             }
+
+
+def initialize_cohort_report_collections(report):
+    report.setdefault('masters', [])
+    report.setdefault('coverages', [])
+
+
+def upsert_cohort_report_record(report, collection_name, record):
+    records = report.setdefault(collection_name, [])
+    cohort_id = record.get('cohort')
+    for index, existing in enumerate(records):
+        if existing.get('cohort') == cohort_id:
+            records[index] = record
+            return
+    records.append(record)
+
+
+def cohort_report_record(report, collection_name, cohort_id):
+    return next(
+        (
+            record for record in report.get(collection_name, [])
+            if record.get('cohort') == cohort_id
+        ),
+        None,
+    )
+
+
+def reusable_report_artifact(record, key, expected_path, label):
+    if not record or not record.get(key):
+        return False
+    recorded_path = Path(record[key]).expanduser().resolve()
+    if recorded_path != Path(expected_path).expanduser().resolve():
+        return False
+    try:
+        current = require_siril_artifact(recorded_path, label)
+    except SirilCommandError:
+        return False
+    recorded = next(
+        (
+            artifact for artifact in (quality_report or {}).get('artifact_postconditions', [])
+            if Path(artifact.get('path', '')).expanduser().resolve() == recorded_path
+        ),
+        None,
+    )
+    if recorded and recorded.get('sha256') and recorded['sha256'] != current['sha256']:
+        return False
+    return True
 
 
 def read_exposure_seconds(path):
@@ -2462,6 +2844,35 @@ def check_runtime_disk_headroom():
             f'{required} bytes required by --minimum-free-disk-gb.'
         )
     return available
+
+
+def check_preflight_storage_headroom(input_bytes):
+    estimated_peak = estimate_peak_storage_bytes(input_bytes, drizzle_enabled)
+    emergency_reserve = int(minimum_free_disk_gb * 1024 ** 3)
+    required = max(estimated_peak, emergency_reserve)
+    work_root = workdir if workdir.exists() else workdir.parent
+    output_root = output_dir if output_dir.exists() else output_dir.parent
+    available = min(shutil.disk_usage(work_root).free, shutil.disk_usage(output_root).free)
+    if available < required:
+        raise RuntimeError(
+            f'Preflight storage estimate requires {required} bytes, but only '
+            f'{available} bytes are available. No input frames were staged.'
+        )
+    return {'required_bytes': required, 'available_bytes': available}
+
+
+def build_failure_context(error):
+    return {
+        'error': str(error),
+        'exception_type': type(error).__name__,
+        'traceback': ''.join(traceback.format_exception(type(error), error, error.__traceback__)),
+        'phase': active_phase,
+        'cohort': active_cohort_id,
+        'substack': quality_report.get('active_substack') if quality_report else None,
+        'last_siril_command': quality_report.get('last_failed_command') if quality_report else None,
+        'siril_response_tail': quality_report.get('siril_response_tail', []) if quality_report else [],
+        'recovery_action': 'Inspect Checkpoint Status, then use Resume Run if all checks pass.',
+    }
 
 
 def _read_jsonl_records(path):
@@ -2719,6 +3130,44 @@ def _sha256_file(path, chunk_size=1024 * 1024):
         while chunk := stream.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def build_artifact_inventory(report):
+    candidates = []
+    masters = report.get('masters') or ([report.get('master', {})] if report.get('master') else [])
+    coverages = report.get('coverages') or ([report.get('coverage', {})] if report.get('coverage') else [])
+    for master in masters:
+        candidates.append(('master', master.get('path'), master.get('cohort')))
+    for coverage in coverages:
+        cohort = coverage.get('cohort')
+        candidates.extend((
+            ('coverage_map', coverage.get('path'), cohort),
+            ('integration_time_map', coverage.get('integration_time_path'), cohort),
+            ('cropped_master', coverage.get('cropped_master_path'), cohort),
+        ))
+    inventory = []
+    seen = set()
+    for role, value, cohort in candidates:
+        if not value:
+            continue
+        path = Path(value)
+        key = str(path.resolve())
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        width, height = _read_fits_dimensions(path)
+        entry = {
+            'role': role,
+            'path': str(path),
+            'bytes': path.stat().st_size,
+            'width': width,
+            'height': height,
+            'sha256': _sha256_file(path),
+        }
+        if cohort:
+            entry['cohort'] = cohort
+        inventory.append(entry)
+    return inventory
 
 
 def scan_input_integrity(
@@ -2986,7 +3435,13 @@ def require_siril_artifact(path, label):
         raise SirilCommandError(f'{label} is missing or invalid: {path} ({error})') from error
     if size <= 0 or width < 1 or height < 1:
         raise SirilCommandError(f'{label} is empty or has invalid dimensions: {path}')
-    return {'path': str(path), 'bytes': size, 'width': width, 'height': height}
+    return {
+        'path': str(path),
+        'bytes': size,
+        'width': width,
+        'height': height,
+        'sha256': _sha256_file(path),
+    }
 
 
 def validate_fits_payload(path):
@@ -3227,11 +3682,141 @@ def _read_siril_sequence_placements(path):
     return [dict(image, **shift) for image, shift in zip(images, shifts)]
 
 
+def create_registered_map_sequence(source_path, destination_path, sequence_name):
+    source_lines = Path(source_path).read_text(encoding='utf-8').splitlines()
+    registration_layers = [
+        match.group(1)
+        for line in source_lines
+        if (match := re.match(r'^R(\d+)\s', line))
+    ]
+    if not registration_layers:
+        raise ValueError(f'No registration records found in {source_path}')
+    registration_layer = registration_layers[0]
+    output_lines = []
+    header_replaced = False
+    for line in source_lines:
+        if line.startswith('S '):
+            line, replacements = re.subn(
+                r"^(S\s+)'[^']*'", rf"\1'{sequence_name}'", line, count=1
+            )
+            if replacements != 1:
+                raise ValueError(f'Unsupported Siril sequence header: {source_path}')
+            header_replaced = True
+        elif line.startswith('L '):
+            line = 'L 1'
+        registration = re.match(r'^R(\d+)(\s.*)$', line)
+        if registration:
+            if registration.group(1) != registration_layer:
+                continue
+            line = f'R0{registration.group(2)}'
+        statistics = re.match(r'^M(\d+)(-.*)$', line)
+        if statistics:
+            if statistics.group(1) != registration_layer:
+                continue
+            line = f'M0{statistics.group(2)}'
+        output_lines.append(line)
+    if not header_replaced:
+        raise ValueError(f'Missing Siril sequence header: {source_path}')
+    _atomic_write_text(destination_path, '\n'.join(output_lines) + '\n')
+
+
+def register_substack_coverage_maps(process_folder, local_dir, substack_count):
+    source_sequence = process_folder / 'pp_light_.seq'
+    sequence_name = 'coverage_source_'
+    sequence_path = local_dir / f'{sequence_name}.seq'
+    source_lines = source_sequence.read_text(encoding='utf-8').splitlines()
+    header = next((line for line in source_lines if line.startswith('S ')), None)
+    match = re.match(r"^S\s+'[^']*'\s+(.+)$", header or '')
+    if not match:
+        raise ValueError(f'Unsupported Siril sequence header: {source_sequence}')
+    fields = match.group(1).split()
+    fixed_length = int(fields[3])
+    scales = {}
+    for number in range(1, substack_count + 1):
+        source = local_dir / f'integration_time_map_substack_{number}.fit'
+        destination = local_dir / f'{sequence_name}{number:0{fixed_length}d}.fit'
+        coverage = np.asarray(_read_fits_array(source), dtype=np.float32)
+        scale = float(np.nanmax(coverage)) if coverage.size else 0.0
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError(f'Invalid coverage values in {source}')
+        scales[number] = scale
+        _write_coverage_fits(
+            destination,
+            coverage / scale if scale else coverage,
+            unit='relative',
+        )
+    create_registered_map_sequence(source_sequence, sequence_path, sequence_name)
+    try:
+        execute_siril(f'cd {siril_path(local_dir)}')
+        execute_siril(
+            'seqapplyreg coverage_source -prefix=registered_ '
+            '-framing=max -interp=nearest'
+        )
+    except Exception:
+        try:
+            execute_siril(f'cd {siril_path(process_folder)}')
+        except Exception:
+            pass
+        raise
+    else:
+        execute_siril(f'cd {siril_path(process_folder)}')
+    output_sequence = local_dir / f'registered_{sequence_name}.seq'
+    records = [
+        record for record in _read_siril_sequence_placements(output_sequence)
+        if record['included'] and 1 <= record['number'] <= substack_count
+    ]
+    if len(records) != substack_count:
+        raise ValueError(
+            f'Expected {substack_count} registered coverage maps, found {len(records)}'
+        )
+    registered = {
+        record['number']: _read_fits_array(
+            local_dir
+            / f'registered_{sequence_name}{record["number"]:0{fixed_length}d}.fit'
+        ) * scales[record['number']]
+        for record in records
+    }
+    return registered, records
+
+
 def _round_to_int(value):
     return math.floor(value + 0.5) if value >= 0 else math.ceil(value - 0.5)
 
 
-def _write_coverage_fits(path, coverage, unit='frame'):
+def _read_fits_header_cards(path):
+    cards = []
+    with Path(path).open('rb') as stream:
+        while True:
+            block = stream.read(2880)
+            if not block:
+                raise ValueError(f'FITS header is incomplete: {path}')
+            for offset in range(0, len(block), 80):
+                card = block[offset:offset + 80].decode('ascii', errors='replace')
+                if card[:8].strip().upper() == 'END':
+                    return cards
+                cards.append(card)
+
+
+def _celestial_wcs_cards(path):
+    scalar_names = {'WCSAXES', 'RADESYS', 'RADECSYS', 'EQUINOX', 'EPOCH', 'LONPOLE', 'LATPOLE'}
+    axis_pattern = re.compile(r'^(CTYPE|CUNIT|CRPIX|CRVAL|CDELT|CROTA)[12]$')
+    matrix_pattern = re.compile(r'^(CD|PC)[12]_[12]$')
+    distortion_pattern = re.compile(r'^(A|B|AP|BP)_(ORDER|\d+_\d+)$|^(PV|PS)[12]_\d+$')
+    return [
+        card for card in _read_fits_header_cards(path)
+        if (
+            card[8:10] == '= '
+            and (
+                card[:8].strip().upper() in scalar_names
+                or axis_pattern.match(card[:8].strip().upper())
+                or matrix_pattern.match(card[:8].strip().upper())
+                or distortion_pattern.match(card[:8].strip().upper())
+            )
+        )
+    ]
+
+
+def _write_coverage_fits(path, coverage, unit='frame', extra_cards=None):
     height, width = coverage.shape
     floating = np.issubdtype(coverage.dtype, np.floating)
     cards = [
@@ -3244,8 +3829,9 @@ def _write_coverage_fits(path, coverage, unit='frame'):
         'BSCALE  =                    1',
         f"BUNIT   = '{unit}'",
         'EXTEND  =                    T',
-        'END',
     ]
+    cards.extend(extra_cards or [])
+    cards.append('END')
     header = b''.join(card.ljust(80).encode('ascii') for card in cards)
     header = header.ljust((len(header) + 2879) // 2880 * 2880, b' ')
     data = np.asarray(coverage, dtype='>f4' if floating else '>i4').tobytes(order='C')
@@ -3253,15 +3839,81 @@ def _write_coverage_fits(path, coverage, unit='frame'):
     _atomic_write_bytes(path, header + data)
 
 
+def finalize_coverage_maps(master_path, coverage_report):
+    if not coverage_report or coverage_report.get('status') == 'unavailable':
+        return coverage_report
+    master_path = Path(master_path)
+    integration_path = Path(coverage_report['integration_time_path'])
+    coverage_path = Path(coverage_report['path'])
+    master = _read_fits_array(master_path)
+    integration = np.asarray(_read_fits_array(integration_path), dtype=np.float32)
+    master_support = np.isfinite(master) & (np.abs(master) > 1e-7)
+    if master.ndim == 3:
+        master_support = np.any(master_support, axis=0)
+    if integration.shape != master_support.shape:
+        raise ValueError(
+            f'Coverage canvas {integration.shape[1]}x{integration.shape[0]} does not match '
+            f'master canvas {master_support.shape[1]}x{master_support.shape[0]}.'
+        )
+    footprint = _fill_drizzle_footprint(master_support) if drizzle_enabled else master_support
+    integration[~footprint] = 0
+    covered = np.isfinite(integration) & (integration > 0)
+    signal_outside = int(np.count_nonzero(master_support & ~covered))
+    coverage_outside = int(np.count_nonzero(covered & ~footprint))
+    if signal_outside:
+        raise ValueError(
+            f'Coverage map misses {signal_outside} nonzero master pixel(s); refusing to finalize.'
+        )
+    maximum = float(integration.max())
+    wcs_cards = _celestial_wcs_cards(master_path)
+    _write_coverage_fits(integration_path, integration, unit='s', extra_cards=wcs_cards)
+    _write_coverage_fits(
+        coverage_path,
+        integration / maximum if maximum else integration,
+        unit='relative',
+        extra_cards=wcs_cards,
+    )
+    coverage_report.update({
+        'normalization_seconds': maximum,
+        'maximum_coverage': maximum,
+        'maximum_integration_seconds': maximum,
+        'master_signal_pixels': int(np.count_nonzero(master_support)),
+        'coverage_footprint_pixels': int(np.count_nonzero(covered)),
+        'master_signal_outside_coverage_pixels': signal_outside,
+        'coverage_outside_master_footprint_pixels': coverage_outside,
+        'footprint_model': 'filled drizzle detector footprint' if drizzle_enabled else 'finite nonzero master pixels',
+        'wcs_status': 'copied' if wcs_cards else 'unavailable',
+        'wcs_source': str(master_path),
+    })
+    if quality_report is not None:
+        postconditions = quality_report.setdefault('artifact_postconditions', [])
+        for path, label in (
+            (integration_path, 'Integration-time map artifact'),
+            (coverage_path, 'Coverage map artifact'),
+        ):
+            artifact = require_siril_artifact(path, label)
+            postconditions[:] = [
+                item for item in postconditions
+                if Path(item.get('path', '')).expanduser().resolve() != path.resolve()
+            ]
+            postconditions.append(artifact)
+    return coverage_report
+
+
 def _compose_coverage_arrays(local_maps, placements):
     if not local_maps or not placements:
         raise ValueError('No local coverage maps or final placements were provided.')
+    for record in placements:
+        if record['width'] is None or record['height'] is None:
+            height, width = np.asarray(local_maps[record['number']]).shape[-2:]
+            record['width'] = width
+            record['height'] = height
     min_x = min(record['h02'] for record in placements)
     min_y = min(record['h12'] for record in placements)
     max_x = max(record['h02'] + record['width'] for record in placements)
     max_y = max(record['h12'] + record['height'] for record in placements)
-    canvas_width = int(max_x) - int(min_x) + 1
-    canvas_height = int(max_y) - int(min_y) + 1
+    canvas_width = math.ceil(max_x) - math.floor(min_x) + 1
+    canvas_height = math.ceil(max_y) - math.floor(min_y) + 1
     composed = np.zeros((canvas_height, canvas_width), dtype=np.float32)
     for record in placements:
         local = np.asarray(local_maps[record['number']], dtype=np.float32)
@@ -3496,6 +4148,8 @@ def generate_coverage_map(
         valid = np.isfinite(array) & (np.abs(array) > 1e-7)
         if array.ndim == 3:
             valid = np.any(valid, axis=0)
+        if drizzle_enabled:
+            valid = _fill_drizzle_footprint(valid)
         height, width = valid.shape
         if (height, width) != (record['height'], record['width']):
             raise ValueError(
@@ -3527,7 +4181,12 @@ def generate_coverage_map(
         'maximum_coverage_unit': 's',
         'maximum_integration_seconds': maximum,
         'exposure_range_seconds': [min(exposures), max(exposures)],
-        'integration_basis': 'sum of registered EXPTIME over finite nonzero pixels before per-pixel rejection and stacking weights',
+        'integration_basis': (
+            'sum of registered EXPTIME over transformed detector footprints; '
+            'interior drizzle sampling holes filled'
+            if drizzle_enabled else
+            'sum of registered EXPTIME over finite nonzero pixels before per-pixel rejection and stacking weights'
+        ),
         'width': int(coverage.shape[1]),
         'height': int(coverage.shape[0]),
         'canvas_source': 'Siril maximize framing',
@@ -3553,25 +4212,29 @@ def generate_coverage_map(
     return report
 
 
+def _fill_drizzle_footprint(valid):
+    valid = np.asarray(valid, dtype=bool)
+    populated_rows = np.flatnonzero(np.any(valid, axis=1))
+    if not populated_rows.size:
+        return valid
+    left_edges = np.argmax(valid[populated_rows], axis=1)
+    right_edges = valid.shape[1] - 1 - np.argmax(valid[populated_rows, ::-1], axis=1)
+    rows = np.arange(populated_rows[0], populated_rows[-1] + 1)
+    left = np.rint(np.interp(rows, populated_rows, left_edges)).astype(int)
+    right = np.rint(np.interp(rows, populated_rows, right_edges)).astype(int)
+    footprint = np.zeros_like(valid)
+    for row, left_edge, right_edge in zip(rows, left, right):
+        footprint[row, left_edge:right_edge + 1] = True
+    return footprint
+
+
 def compose_substack_coverage_maps(process_folder, local_dir, substack_count):
-    final_sequence = process_folder / 'r_pp_light_.seq'
-    if not final_sequence.is_file():
-        final_sequence = process_folder / 'r_pp_light.seq'
     try:
-        records = [
-            record for record in _read_siril_sequence_placements(final_sequence)
-            if record['included'] and 1 <= record['number'] <= substack_count
-        ]
-        local_maps = {}
+        registered_maps, records = register_substack_coverage_maps(
+            process_folder, Path(local_dir), substack_count
+        )
         local_reports = quality_report.get('substack_coverages', {}) if quality_report else {}
-        for record in records:
-            map_path = Path(local_dir) / f"integration_time_map_substack_{record['number']}.fit"
-            local_maps[record['number']] = _read_fits_array(map_path)
-        if len(records) != substack_count:
-            raise ValueError(
-                f'Expected {substack_count} registered substacks, found {len(records)}'
-            )
-        coverage = _compose_coverage_arrays(local_maps, records)
+        coverage = _compose_coverage_arrays(registered_maps, records)
     except (OSError, ValueError, KeyError) as exc:
         report = {
             'status': 'unavailable',
@@ -3613,7 +4276,7 @@ def compose_substack_coverage_maps(process_folder, local_dir, substack_count):
         'integration_basis': 'sum of per-substack integration-time maps placed on the final master registration canvas',
         'width': int(coverage.shape[1]),
         'height': int(coverage.shape[0]),
-        'canvas_source': 'composed substack coverage maps on final Siril registration canvas',
+        'canvas_source': 'substack coverage maps transformed by final Siril registration',
         'substack_count': substack_count,
     }
     if active_cohort_id is not None:
@@ -3642,20 +4305,24 @@ def finalize_integration_report(input_summary):
         for substack in quality_report.get('substacks', [])
     )
     substacks = quality_report.get('substacks', [])
+    per_cohort = bool(quality_report.get('settings', {}).get('export_per_cohort'))
     exact_stacked_exposure = bool(substacks) and all(
         'stage_exposure_seconds' in substack
         and substack['stage_exposure_seconds'].get('stacked') is not None
         for substack in quality_report.get('substacks', [])
     )
-    if quality_report.get('masters'):
+    if quality_report.get('masters') and not per_cohort:
         master_count = sum(
             master.get('stacked_frames', 0) or 0
             for master in quality_report['masters']
         )
-    else:
+    elif not per_cohort:
         master_count = quality_report.get('master', {}).get('stacked_frames')
-    if (len(substacks) > 1 and master_count != len(substacks)) or (
-        master_count is not None and master_count != len(substacks)
+    else:
+        master_count = None
+    if not per_cohort and (
+        (len(substacks) > 1 and master_count != len(substacks)) or
+        (master_count is not None and master_count != len(substacks))
     ):
         exact_stacked_exposure = False
     quality_report['integration'] = {
@@ -3888,7 +4555,10 @@ def substack(group_num, cat=None):
             file_current=group_file_offset + count_sequence_files(process_folder, background_sequence),
         )
     phase(0.40, 0.58, "Plate solving", track_files=True)
-    plate_solve_response = execute_siril(build_plate_solve_command(background_sequence, cat))
+    plate_solve_response = execute_siril(
+        build_plate_solve_command(background_sequence, cat),
+        allow_partial=skip_failed_frames,
+    )
     phase(
         0.58, 0.58, "Plate solving", track_files=True,
         file_current=group_file_offset + count_sequence_files(process_folder, background_sequence),
@@ -4028,12 +4698,21 @@ def masterstack(SubStack_nb):
                 "substack_1_", f"{master_stack_path().stem}_", 1
             )
             shutil.copy2(rejection_map, output_dir / master_name)
+        artifact = require_siril_artifact(master_stack_path(), 'Master stack artifact')
         if quality_report is not None:
             quality_report["master"] = {
+                "stacked_frames": 1,
+                "output": {
+                    "width": artifact["width"],
+                    "height": artifact["height"],
+                },
                 "method": "single substack copy",
                 "path": str(master_stack_path()),
+                "weight": stacking_weight,
+                "rejection": pixel_rejection_method,
             }
-        require_siril_artifact(master_stack_path(), 'Master stack artifact')
+            quality_report.setdefault('artifact_postconditions', []).append(artifact)
+            finalize_coverage_maps(master_stack_path(), quality_report.get('coverage'))
         report_progress(98, 98, "Master stack complete")
         return
 
@@ -4049,7 +4728,9 @@ def masterstack(SubStack_nb):
     report_progress(94, 95.5, "Registering substacks")
     execute_siril(build_master_registration_command())
     report_progress(95.5, 96, "Applying master registration")
-    execute_siril(f"seqapplyreg pp_light -interp={registration_interpolation}")
+    execute_siril(
+        f"seqapplyreg pp_light -framing=max -interp={registration_interpolation}"
+    )
     if SubStack_nb > 1 and coverage_map_enabled:
         compose_substack_coverage_maps(
             process_folder,
@@ -4087,9 +4768,12 @@ def masterstack(SubStack_nb):
             pixel_rejection_method if use_master_rejection else "none"
         )
         quality_report.setdefault('artifact_postconditions', []).append(artifact)
+        finalize_coverage_maps(master_stack_path(), quality_report.get('coverage'))
 
 def final_cleanup():
     report_progress(98, 100, "Writing final outputs")
+    if app is not None and not siril_unresponsive:
+        execute_siril(f"cd {siril_path(output_dir)}")
     remove_tree(workdir / 'Lights_sorted')
     remove_tree(workdir / 'substacks')
     report_progress(100, 100, "Complete")
@@ -4137,6 +4821,11 @@ def create_cropped_master():
     selection = dict(bounds, y=master_height - bounds['y'] - bounds['height'])
     quality_report['coverage']['crop_siril_selection'] = selection
     cropped_path = output_dir / f"{master_stack_path().stem}_cropped.fit"
+    if reusable_report_artifact(
+        coverage_report, 'cropped_master_path', cropped_path, 'Cropped master artifact'
+    ):
+        print(f"[INFO] Resuming: reusing coverage-cropped master: {cropped_path}", flush=True)
+        return
     execute_siril(f"cd {siril_path(output_dir)}")
     execute_siril(f"load {siril_path(master_stack_path().with_suffix(''))}")
     execute_siril(
@@ -4145,7 +4834,8 @@ def create_cropped_master():
     )
     execute_siril("crop")
     execute_siril(f"save {siril_path(cropped_path.with_suffix(''))}")
-    require_siril_artifact(cropped_path, 'Cropped master artifact')
+    artifact = require_siril_artifact(cropped_path, 'Cropped master artifact')
+    quality_report.setdefault('artifact_postconditions', []).append(artifact)
     quality_report['coverage']['cropped_master_path'] = str(cropped_path)
     print(f"[INFO] Coverage-cropped master: {cropped_path}", flush=True)
 
@@ -4182,6 +4872,13 @@ def build_parser():
         help="write one independent master for each acquisition cohort",
     )
     parser.add_argument(
+        "--cohort-group-by",
+        choices=COHORT_GROUP_FIELDS,
+        action="append",
+        default=None,
+        help="cohort grouping field; repeat for camera, filter, or exposure_seconds",
+    )
+    parser.add_argument(
         "--auto-crop-coverage-percent", type=int, default=50,
         help="minimum crop integration time as a percentage of the nonblank-pixel median; lower keeps more field",
     )
@@ -4190,7 +4887,7 @@ def build_parser():
         "--auto-substacks",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="calculate the substack count to keep each sequence at or below 8192 frames",
+        help="calculate the substack count using the detected Siril frame limit",
     )
     parser.add_argument("--drizzle", action=argparse.BooleanOptionalAction, default=drizzle_enabled)
     parser.add_argument("--drizzle-scale", default=drizzle_scale)
@@ -4371,11 +5068,13 @@ def configure(arguments):
     global mosaic_aware_star_count, test_frame_count, coverage_map_enabled
     global auto_crop_enabled, auto_crop_coverage_percent, debug
     global export_per_cohort
+    global cohort_group_fields
     global sky_quality_percent, run_seed, journal_path, frame_ledger_path
     global resume_enabled, resume_checkpoint_data
     global journal_sequence, command_sequence
     global active_phase, journal_warning_emitted
     global siril_open_timeout, siril_command_timeout, siril_unresponsive
+    global siril_version_text, siril_version_tuple, siril_max_stack_frames
 
     workdir = arguments.workdir.expanduser().resolve()
     selected_output = arguments.output_dir or (workdir / "Siril Mosaic Output")
@@ -4416,6 +5115,9 @@ def configure(arguments):
     journal_warning_emitted = False
     siril_unresponsive = False
     siril_exe = arguments.siril_exe.expanduser().resolve()
+    siril_version_text = 'unavailable'
+    siril_version_tuple = None
+    siril_max_stack_frames = SIRIL_LEGACY_MAX_STACK_FRAMES
     cancel_file = arguments.cancel_file.expanduser().resolve() if arguments.cancel_file else None
     SubStack_nb = arguments.substacks
     auto_substacks = arguments.auto_substacks
@@ -4468,13 +5170,19 @@ def configure(arguments):
     coverage_map_enabled = arguments.coverage_map
     auto_crop_enabled = arguments.auto_crop_master
     export_per_cohort = arguments.export_per_cohort
+    cohort_group_fields = tuple(arguments.cohort_group_by or COHORT_GROUP_FIELDS)
     auto_crop_coverage_percent = arguments.auto_crop_coverage_percent
     sky_quality_percent = arguments.sky_quality_percent
     debug = arguments.debug
+    if resume_checkpoint_data is not None and resume_checkpoint_data.get('settings'):
+        saved_settings = resume_checkpoint_data['settings']
+        if configuration_hash(saved_settings) != resume_checkpoint_data.get('configuration_hash'):
+            raise ValueError('Resume checkpoint settings are internally inconsistent.')
+        apply_runtime_settings(saved_settings)
 
 
 def validate_parameters():
-    global SubStack_nb
+    global SubStack_nb, siril_version_text, siril_version_tuple, siril_max_stack_frames
     if not workdir.is_dir():
         raise ValueError("Input folder does not exist.")
     if output_dir == workdir:
@@ -4503,16 +5211,33 @@ def validate_parameters():
         raise ValueError("Auto-crop master requires the coverage map.")
     if export_per_cohort and debug:
         raise ValueError("Debug mode is unavailable when exporting one master per cohort.")
+    if export_per_cohort and not cohort_group_fields:
+        raise ValueError("At least one cohort grouping field is required when exporting per cohort.")
     if not 1 <= auto_crop_coverage_percent <= 100:
         raise ValueError("Auto-crop coverage percentage must be from 1 to 100.")
     effective_count = checkpoint_count if resume_enabled else (test_frame_count or light_count)
     if not siril_exe.is_file():
         raise ValueError("Siril executable does not exist.")
+    siril_version_text = detect_siril_version()
+    siril_version_tuple = parse_siril_version(siril_version_text)
+    siril_max_stack_frames = siril_frame_limit_for_version(siril_version_text)
     if auto_substacks:
-        SubStack_nb = math.ceil(effective_count / SIRIL_MAX_STACK_FRAMES)
+        if siril_version_tuple is None:
+            print(
+                f"[WARNING] Could not parse Siril version {siril_version_text!r}; "
+                f"using the conservative {siril_max_stack_frames}-frame limit.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[INFO] Siril {siril_version_text}; auto substack limit: "
+                f"{siril_max_stack_frames} frame(s)",
+                flush=True,
+            )
+        SubStack_nb = math.ceil(effective_count / siril_max_stack_frames)
         print(
             f"[INFO] Auto substacks: {effective_count} frame(s) -> "
-            f"{SubStack_nb} substack(s), max {SIRIL_MAX_STACK_FRAMES} frames each",
+            f"{SubStack_nb} substack(s), max {siril_max_stack_frames} frames each",
             flush=True,
         )
     if SubStack_nb < 1:
@@ -4623,8 +5348,7 @@ def run_pipeline(arguments):
         assert checkpoint_state is not None
         if export_per_cohort and not checkpoint_state.get('cohorts'):
             raise ValueError('This checkpoint predates per-cohort resume support; start a new cohort run.')
-        SubStack_nb = int(checkpoint_state['substack_count'])
-        if checkpoint_state.get('configuration_hash') != configuration_hash():
+        if not checkpoint_state.get('settings') and checkpoint_state.get('configuration_hash') != configuration_hash():
             raise ValueError(
                 'Resume settings do not match the interrupted run. '
                 'Use the same processing settings and seed.'
@@ -4636,14 +5360,14 @@ def run_pipeline(arguments):
         random.seed(run_seed)
         if test_frame_count:
             input_files = random.sample(input_files, test_frame_count)
-        cohort_batches = partition_frame_cohorts(input_files) if export_per_cohort else [(None, input_files)]
+        cohort_batches = partition_frame_cohorts(input_files, cohort_group_fields) if export_per_cohort else [(None, input_files)]
         print("[DRY RUN] No files will be moved, no Siril process will be started, and no outputs will be written.")
         print(
             f"[DRY RUN] Input frames: {len(input_files)} "
             f"({len(current_input_files)} current + "
             f"{len(pending_rejects)} prior rejects to restore)"
         )
-        print(f"[DRY RUN] Acquisition cohorts: {len(summarize_frame_cohorts(input_files))}")
+        print(f"[DRY RUN] Acquisition cohorts: {len(summarize_frame_cohorts(input_files, cohort_group_fields))}")
         print(f"[DRY RUN] Substacks: {SubStack_nb}{' (automatic)' if auto_substacks else ''}")
         print(f"[DRY RUN] Configuration hash: {configuration_hash()}")
         print(f"[DRY RUN] Seed: {run_seed}")
@@ -4721,13 +5445,15 @@ def run_pipeline(arguments):
                 )
             input_frame_count = len(input_files)
             active_run_file_total = input_frame_count
-            cohort_batches = partition_frame_cohorts(input_files) if export_per_cohort else [(None, input_files)]
+            cohort_batches = partition_frame_cohorts(input_files, cohort_group_fields) if export_per_cohort else [(None, input_files)]
             input_manifest_path = write_input_manifest(input_files, cohort_batches)
             _atomic_write_text(frame_ledger_file_path(), '')
             input_summary = summarize_input_frames(input_files)
-            cohort_summary = summarize_frame_cohorts(input_files)
+            storage_preflight = check_preflight_storage_headroom(input_summary['bytes'])
+            cohort_summary = summarize_frame_cohorts(input_files, cohort_group_fields)
             quality_report = initialize_quality_report(input_frame_count)
             quality_report["input_summary"] = input_summary
+            quality_report["storage_preflight"] = storage_preflight
             quality_report["cohorts"] = cohort_summary
             quality_report["restored_rejected_files"] = restored_rejected_files
             quality_report["input_manifest"] = str(input_manifest_path)
@@ -4739,24 +5465,29 @@ def run_pipeline(arguments):
             if export_per_cohort:
                 for cohort_id, cohort_files in cohort_batches:
                     cohort_substack_count = (
-                        math.ceil(len(cohort_files) / SIRIL_MAX_STACK_FRAMES)
+                        math.ceil(len(cohort_files) / siril_max_stack_frames)
                         if auto_substacks else min(SubStack_nb, len(cohort_files))
                     )
                     checkpoint_cohorts.append({
                         'id': cohort_id,
                         'files': [path.relative_to(workdir).as_posix() for path in cohort_files],
                         'substack_count': max(1, cohort_substack_count),
-                        'groups': {},
+                        'groups': plan_group_assignments(
+                            cohort_files, workdir, max(1, cohort_substack_count)
+                        ),
                         'completed_substacks': [],
                         'state': 'pending',
+                        'phase': 'pending',
                     })
             checkpoint_state = {
                 'schema_version': 2 if export_per_cohort else 1,
                 'state': 'running',
+                'global_phase': 'substacks_running',
                 'run_id': run_id,
                 'workdir': str(workdir),
                 'output_dir': str(output_dir),
                 'configuration_hash': configuration_hash(),
+                'settings': runtime_settings(),
                 'seed': run_seed,
                 'input_frames': input_frame_count,
                 'selected_files': [path.relative_to(workdir).as_posix() for path in input_files],
@@ -4798,8 +5529,7 @@ def run_pipeline(arguments):
             execute_siril(f"setcpu {cpu_count}")
         active_cohort_total = len(cohort_batches) if export_per_cohort else None
         if export_per_cohort:
-            quality_report['masters'] = []
-            quality_report['coverages'] = []
+            initialize_cohort_report_collections(quality_report)
         requested_substacks = SubStack_nb
         cohort_file_offset = 0
         completed_substacks = set()
@@ -4810,15 +5540,18 @@ def run_pipeline(arguments):
             if resume_enabled:
                 close_siril_before_staging()
             calculated_substacks = (
-                math.ceil(len(cohort_files) / SIRIL_MAX_STACK_FRAMES)
+                math.ceil(len(cohort_files) / siril_max_stack_frames)
                 if auto_substacks else min(requested_substacks, len(cohort_files))
             )
             SubStack_nb = int(
                 cohort_state.get('substack_count', calculated_substacks)
                 if cohort_state is not None else calculated_substacks
             )
-            if resume_enabled and cohort_state is not None and cohort_state.get('state') == 'complete':
-                print(f'[INFO] Resuming: cohort {cohort_number} is already complete.', flush=True)
+            if resume_enabled and cohort_state is not None and cohort_state.get('state') in {'complete', 'skipped'}:
+                print(
+                    f'[INFO] Resuming: cohort {cohort_number} is already {cohort_state.get("state")}.',
+                    flush=True,
+                )
                 cohort_file_offset += len(cohort_files)
                 continue
             completed_substacks = set()
@@ -4830,8 +5563,15 @@ def run_pipeline(arguments):
                 assert active_cohort_total is not None
                 active_cohort_progress_base = ((cohort_number - 1) * 100) / active_cohort_total
                 active_cohort_progress_span = 100 / active_cohort_total
+            cohort_metadata = next(
+                (
+                    cohort.get('metadata') for cohort in cohort_summary
+                    if cohort.get('id') == cohort_id
+                ),
+                None,
+            )
             active_cohort_tag = (
-                f"cohort_{cohort_number:03d}_{cohort_filename_tag(cohort_files[0])}"
+                f"cohort_{cohort_number:03d}_{cohort_filename_tag(cohort_metadata or cohort_files[0], output_dir, run_id)}"
                 if export_per_cohort else None
             )
             active_master_path = (
@@ -4845,6 +5585,17 @@ def run_pipeline(arguments):
             )
             if resume_enabled:
                 if cohort_state is not None:
+                    if not cohort_state.get('groups'):
+                        if cohort_state.get('completed_substacks'):
+                            raise RuntimeError(
+                                'Resume checkpoint has no staged group assignments for '
+                                'completed substacks.'
+                            )
+                        cohort_state['groups'] = divide_group_assignments(
+                            cohort_state.get('files', []), SubStack_nb
+                        )
+                        checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+                        write_run_checkpoint(checkpoint_state)
                     checkpoint_state['substack_count'] = SubStack_nb
                     checkpoint_state['groups'] = cohort_state.get('groups', {})
                     checkpoint_state['completed_substacks'] = cohort_state.get('completed_substacks', [])
@@ -4858,7 +5609,18 @@ def run_pipeline(arguments):
             else:
                 (workdir / 'Lights_sorted').mkdir()
                 owns_staging = True
-                group_files(workdir, cohort_files)
+                planned_files = None
+                if cohort_state is not None:
+                    planned_files = [
+                        workdir / relative
+                        for group_number in range(1, SubStack_nb + 1)
+                        for relative in cohort_state['groups'][str(group_number)]
+                    ]
+                group_files(
+                    workdir,
+                    planned_files if planned_files is not None else cohort_files,
+                    shuffle_files=planned_files is None,
+                )
                 checkpoint_state['groups'] = {
                     str(group_number): list(manifest.values())
                     for group_number, manifest in read_group_manifests(
@@ -4869,8 +5631,10 @@ def run_pipeline(arguments):
                     cohort_state['substack_count'] = SubStack_nb
                     cohort_state['groups'] = checkpoint_state['groups']
                     cohort_state['state'] = 'running'
+                    cohort_state['phase'] = 'substacks_running'
                 checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
                 write_run_checkpoint(checkpoint_state)
+            cohort_skipped = False
             for i in range(1, SubStack_nb + 1):
                 if i in completed_substacks:
                     print(f'[INFO] Resuming: substack {i} is already complete.', flush=True)
@@ -4884,6 +5648,53 @@ def run_pipeline(arguments):
                         failure = f'Substack {i} produced no stack'
                     except CancellationRequested:
                         raise
+                    except NoPlateSolveFramesError as error:
+                        if not export_per_cohort:
+                            raise RuntimeError(
+                                f'Cohort {active_cohort_id or cohort_number} has no plate-solvable frames.'
+                            ) from error
+                        skipped_cohort = {
+                            'number': cohort_number,
+                            'cohort': active_cohort_id,
+                            'input_frames': len(cohort_files),
+                            'successful_plate_solve_frames': 0,
+                            'reason_code': 'no_plate_solve_frames',
+                            'reason': str(error),
+                        }
+                        quality_report.setdefault('skipped_cohorts', []).append(skipped_cohort)
+                        restore_staged_cohort_sources()
+                        owns_staging = False
+                        if cohort_state is not None:
+                            cohort_state['state'] = 'skipped'
+                            cohort_state['phase'] = 'skipped'
+                            cohort_state['groups'] = {}
+                            cohort_state['completed_substacks'] = []
+                            cohort_state['error'] = str(error)
+                        checkpoint_state['groups'] = {}
+                        checkpoint_state['completed_substacks'] = []
+                        checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+                        write_run_checkpoint(checkpoint_state)
+                        write_quality_report('running')
+                        append_journal_event(
+                            'cohort_skipped',
+                            cohort=active_cohort_id,
+                            cohort_number=cohort_number,
+                            input_frames=len(cohort_files),
+                            reason_code='no_plate_solve_frames',
+                        )
+                        print(
+                            f'[WARNING] Skipping cohort {cohort_number}: no frames successfully plate-solved.',
+                            flush=True,
+                        )
+                        active_cohort_id = None
+                        active_cohort_number = None
+                        active_cohort_tag = None
+                        active_cohort_file_total = None
+                        active_cohort_progress_base = 0.0
+                        active_cohort_progress_span = 100.0
+                        cohort_file_offset += len(cohort_files)
+                        cohort_skipped = True
+                        break
                     except SirilCommandError as error:
                         failure = str(error)
                     retries += 1
@@ -4924,20 +5735,86 @@ def run_pipeline(arguments):
                 checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
                 write_run_checkpoint(checkpoint_state)
                 check_runtime_disk_headroom()
-            masterstack(SubStack_nb)
-            if export_per_cohort:
-                master = quality_report.pop('master')
-                master['cohort'] = active_cohort_id
-                quality_report['masters'].append(master)
+            if cohort_skipped:
+                continue
+            reusable_master = None
+            if (
+                resume_enabled
+                and cohort_state is not None
+                and cohort_state.get('phase') in FINALIZATION_PHASES
+            ):
+                reusable_master = cohort_report_record(
+                    quality_report, 'masters', active_cohort_id
+                )
+                if not reusable_report_artifact(
+                    reusable_master, 'path', master_stack_path(), 'Master stack artifact'
+                ):
+                    reusable_master = None
+            if reusable_master is None:
+                masterstack(SubStack_nb)
+                if export_per_cohort:
+                    master = quality_report.pop('master')
+                    master['cohort'] = active_cohort_id
+                    upsert_cohort_report_record(quality_report, 'masters', master)
+                if cohort_state is not None:
+                    cohort_state['state'] = 'running'
+                    cohort_state['phase'] = 'master_written'
+                    checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+                    write_quality_report('running')
+                    write_run_checkpoint(checkpoint_state)
+            else:
+                print(
+                    f'[INFO] Resuming: reusing validated master for cohort {cohort_number}.',
+                    flush=True,
+                )
             if coverage_map_enabled:
+                if reusable_master is not None:
+                    reusable_coverage = cohort_report_record(
+                        quality_report, 'coverages', active_cohort_id
+                    )
+                    coverage_path = (
+                        reusable_coverage.get('integration_time_path')
+                        if reusable_coverage else None
+                    )
+                    expected_coverage_path = output_dir / (
+                        f'integration_time_map_{run_id}_{active_cohort_tag}.fit'
+                    )
+                    if not coverage_path or not reusable_report_artifact(
+                        reusable_coverage,
+                        'integration_time_path',
+                        expected_coverage_path,
+                        'Integration-time map artifact',
+                    ):
+                        raise RuntimeError(
+                            f'Resume master exists for cohort {cohort_number}, but its '
+                            'integration-time map is missing or invalid.'
+                        )
+                    assert reusable_coverage is not None
+                    quality_report['coverage'] = dict(reusable_coverage)
+                if export_per_cohort and quality_report.get('coverage'):
+                    upsert_cohort_report_record(
+                        quality_report, 'coverages', quality_report['coverage']
+                    )
+                if cohort_state is not None:
+                    cohort_state['phase'] = 'maps_written'
+                    checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+                    write_quality_report('running')
+                    write_run_checkpoint(checkpoint_state)
+                if auto_crop_enabled and cohort_state is not None:
+                    cohort_state['phase'] = 'crop_pending'
+                    checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+                    write_run_checkpoint(checkpoint_state)
                 create_cropped_master()
                 if export_per_cohort and quality_report.get('coverage'):
-                    quality_report['coverages'].append(quality_report['coverage'])
+                    upsert_cohort_report_record(
+                        quality_report, 'coverages', quality_report['coverage']
+                    )
             check_cancellation()
             if not debug:
                 final_cleanup()
             if cohort_state is not None:
                 cohort_state['state'] = 'complete'
+                cohort_state['phase'] = 'complete'
                 cohort_state['completed_substacks'] = sorted(completed_substacks)
                 checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
                 write_run_checkpoint(checkpoint_state)
@@ -4957,26 +5834,39 @@ def run_pipeline(arguments):
         active_cohort_file_total = None
         report_progress(100, 100, "Complete")
         finalize_integration_report(input_summary)
+        quality_report['artifact_inventory'] = build_artifact_inventory(quality_report)
         quality_report['verification_path'] = str(
             verification_artifact_path(quality_report_path())
         )
         write_quality_report("complete")
         append_journal_event('run_finished', status='complete')
+        verification_exit_code = 0
         try:
             verification_path, verification = write_verification_artifact(quality_report_path())
+            quality_report['verification_status'] = verification['status']
+            write_quality_report('complete')
             print(
                 f"[INFO] Run verification: {verification['status']} "
                 f"({verification['counts']['PASS']} pass, "
                 f"{verification['counts']['WARN']} warn, {verification['counts']['FAIL']} fail)",
                 flush=True,
             )
+            if verification['status'] == 'FAIL':
+                verification_exit_code = 1
         except Exception as verification_error:
+            verification_exit_code = 1
+            quality_report['verification_status'] = 'ERROR'
+            quality_report['verification_error'] = str(verification_error)
+            write_quality_report('complete')
             append_journal_event('verification_failed', error=str(verification_error))
             print(f"[WARNING] Automatic run verification failed: {verification_error}", flush=True)
         remove_run_checkpoint()
-        return 0
+        return verification_exit_code
     except Exception as error:
         cancelled = isinstance(error, CancellationRequested)
+        failure_context = build_failure_context(error)
+        if quality_report is not None:
+            quality_report['failure'] = failure_context
         if cancelled:
             print("[INFO] Cancellation requested; restoring source files...", flush=True)
         prepare_siril_for_cleanup()
@@ -5003,13 +5893,16 @@ def run_pipeline(arguments):
         write_quality_report("cancelled" if cancelled else "failed", error)
         if checkpoint_state is not None:
             checkpoint_state['state'] = 'interrupted'
+            checkpoint_state['global_phase'] = 'interrupted'
             checkpoint_state['error'] = str(error)
+            checkpoint_state['failure'] = failure_context
             checkpoint_state['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
             write_run_checkpoint(checkpoint_state)
         append_journal_event(
             'run_finished',
             status='cancelled' if cancelled else 'failed',
             error=str(error),
+            failure=failure_context,
         )
         if cancelled:
             print("[INFO] Cancellation complete; source files restored.", flush=True)
