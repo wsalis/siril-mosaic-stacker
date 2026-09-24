@@ -156,7 +156,7 @@ P:\python.exe sirilmosaic.py `
   --run-lock-status
 ```
 
-Use `--break-run-lock` only after confirming no stacker or Siril process is active. For long runs, the defaults are a 60-second Siril open timeout, a four-hour command timeout, and 0.5 GB minimum free space; override with `--siril-open-timeout`, `--siril-command-timeout`, and `--minimum-free-disk-gb`.
+Use `--break-run-lock` only after confirming no stacker or Siril process is active. For long runs, the defaults are a 60-second Siril open timeout, no command timeout, and 0.5 GB minimum free space; override with `--siril-open-timeout`, `--siril-command-timeout`, and `--minimum-free-disk-gb`.
 
 ## Crop an Existing Master
 

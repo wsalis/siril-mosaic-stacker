@@ -75,7 +75,7 @@ Use `--run-lock-status` to inspect the owner and age. Confirm that no Python or 
 
 ## Siril watchdog timeout
 
-The backend stops waiting after the configured open or command timeout, terminates descendant Siril processes, marks the pipe unhealthy, and enters normal source rollback. Increase `--siril-open-timeout` or `--siril-command-timeout` for unusually long operations; zero disables the corresponding watchdog only when an external supervisor is present.
+The backend stops waiting after the configured open or command timeout, terminates descendant Siril processes, marks the pipe unhealthy, and enters normal source rollback. The command timeout defaults to `0` (no limit) so long-running integrations are not interrupted; set a positive `--siril-command-timeout` when a watchdog is desired. Siril startup has its own timeout and can be adjusted with `--siril-open-timeout`.
 
 ## Runtime disk headroom failure
 

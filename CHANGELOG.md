@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Run History can export report-only experiment comparison records for multiple completed runs with matching selected-input fingerprints, output identities, settings, rejection diagnostics, a chosen control run, and a written conclusion.
+- Quality reports now summarize available low/high rejection maps by channel using finite positive map locations, affected-location percentages, mean/maximum map values, and a chunk-streamed 4x4 spatial concentration grid. Experiment records include candidate-minus-control deltas for matching rejection percentages, channel imbalance, and map/spatial rates. Unsupported sample counts, blank-sky/noise, and residual-defect metrics remain explicitly unavailable; diagnostics do not affect stacking or rank runs.
+- Low and high rejection maps can be requested independently with Follow method, Always, or Never controls; Always is subject to Siril support, and Siril 1.4.4 cannot generate maps when rejection is disabled. Those requested maps are now reported unavailable with the explicit reason, and no unsupported `-rejmaps` flag is sent.
+- Coverage tests now track synthetic pixel landmarks through single- and multi-substack placement, varied frame sizes, registered rotated/warped grids, and crop-coordinate conversion.
+- Multi-substack coverage finalization now reports master signal within the configured feather/interpolation edge fringe without inventing coverage there, while still rejecting signal gaps beyond that fringe.
+- The successful-run completion dialog can open the configured output directory when it exists.
+- Quality reports and experiment records include report-only low/high channel-imbalance ranges; channel counts are marked unavailable without a source denominator.
+
 ## v2.1 - 2026-09-16
 
 ### Fixed

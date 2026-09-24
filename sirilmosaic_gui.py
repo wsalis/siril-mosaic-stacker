@@ -19,10 +19,10 @@ from datetime import datetime
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Thread
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
-from astro_dark_theme import DARK_BG, DARK_BORDER, DARK_FIELD, DARK_TEXT, configure_dark_theme
+from astro_dark_theme import DARK_BG, DARK_BORDER, DARK_FIELD, DARK_SURFACE, DARK_TEXT, configure_dark_theme
 from sirilmosaic import (
     build_crop_plan,
     build_selection_filters,
@@ -32,6 +32,7 @@ from sirilmosaic import (
     discover_light_files,
     estimate_peak_storage_bytes,
     create_run_bundle,
+    write_experiment_record,
     export_html_run_report,
     delete_stale_artifacts,
     inspect_checkpoint,
@@ -118,6 +119,8 @@ PROFILE_FIELDS = (
     "rejection_low",
     "rejection_high",
     "rejection_method",
+    "low_rejection_map",
+    "high_rejection_map",
     "fast_normalization",
     "catalog",
     "memory",
@@ -163,7 +166,7 @@ Percentage mode keeps the requested best whole-number percentage for each enable
 Mosaic-aware star count removes star count from global rejection when frames cover different sky regions; the other criteria remain active. The experimental sky-quality filter is unsupported and values other than 100 are rejected. The relative filter-retention score in reports is diagnostic only, not an objective sky-quality or Bortle measurement.
 
 REGISTRATION AND INTEGRATION
-Drizzle increases output sampling and needs substantially more time and disk space. The drizzle kernel controls how each input pixel is distributed; Lanczos3 remains the default. Droplet size controls Siril's pixfrac value from 0.1 to 1.0; 0.8 remains the default. Weighting controls registered-frame contribution. Feather blends mosaic borders. Pixel rejection removes unusual values using the selected method and low/high thresholds. Percentile and generalized rejection use thresholds from 0 to 1; the other methods use sigma-like thresholds. Stack normalization defaults to addscale, which combines additive background correction with scaling. Overlap normalization can reduce brightness differences between panels but may be slow. Fast normalization can reduce processing time for large sets. Master rejection is avoided for fewer than four substacks because it is statistically weak.
+Drizzle increases output sampling and needs substantially more time and disk space. The drizzle kernel controls how each input pixel is distributed; Lanczos3 remains the default. Droplet size controls Siril's pixfrac value from 0.1 to 1.0; 0.8 remains the default. Weighting controls registered-frame contribution. Feather blends mosaic borders. Pixel rejection removes unusual values using the selected method and low/high thresholds. Percentile and generalized rejection use thresholds from 0 to 1; the other methods use sigma-like thresholds. Low map and High map independently follow the rejection method by default, or can be set to Always or Never. Always requests the selected map when Siril supports it; Siril 1.4.4 does not generate rejection maps when rejection is set to none, and reports that direction unavailable. Siril generates rejection maps as a pair; an unselected direction is removed from the deliverable outputs. Stack normalization defaults to addscale, which combines additive background correction with scaling. Overlap normalization can reduce brightness differences between panels but may be slow. Fast normalization can reduce processing time for large sets. Master rejection is avoided for fewer than four substacks because it is statistically weak, but explicit map requests override that map-generation threshold when rejection is active.
 
 ADVANCED SIRIL SETTINGS
 The Advanced tab exposes selected Siril controls for plate solving, background extraction, registration, and reproducibility. Defaults preserve the normal workflow. Plate-solve downscale can speed up large images; higher SIP order can model more distortion but may fail on sparse fields. Registration minimum pairs and maximum stars are optional safeguards and are disabled when set to 0.
@@ -276,7 +279,7 @@ Transform chooses shift, similarity, affine, or homography. More flexible transf
 REPRODUCIBILITY
 Random seed controls randomized grouping and selection. The seed, configuration hash, selected-file manifest, command telemetry, and frame ledger allow a run to be audited and compared later.""",
     "Run Review": """SUMMARY
-Run Review shows the loaded report's status, frame accounting, integrated exposure, cohort count, seed, configuration hash, and artifact paths.
+Run Review shows the loaded report's status, frame accounting, integrated exposure, cohort count, seed, configuration hash, artifact paths, and available rejection-map diagnostics. Rejection-map affected locations count finite positive map values; they are not counts of rejected input samples. Missing or unreadable maps are shown as unavailable rather than zero.
 
 VERIFY RUN
 Verify Run is read-only. It checks report status/schema, journal sequence integrity, manifest count, full-frame ledger identity/status/counts, master/map/crop artifacts and dimensions, source restoration, reject agreement, and substack accounting.
@@ -285,7 +288,7 @@ TABLE FILTERS
 Filter uses a value dropdown for low-cardinality fields such as status, reason, and exposure. File and path fields keep the flexible case-insensitive Contains search. Clear Sort & Filter restores the complete table and default order.
 
 EVIDENCE ACTIONS
-Open Frame Ledger shows successful and rejected frame evidence. Export Ledger CSV writes a filtered view. Export Run Bundle creates a ZIP without raw lights. Cleanup Review is deliberately conservative and requires confirmation for approved temporary artifacts.
+Open Frame Ledger shows successful and rejected frame evidence. Export Ledger CSV writes a filtered view. Export Run Bundle creates a ZIP without raw lights. Run Visual QA opens read-only preview diagnostics in a secondary window. Cleanup Review is deliberately conservative and requires confirmation for approved temporary artifacts.
 
 RECOVERY ACTIONS
 Checkpoint Status, Discard Checkpoint, Abandon Run, Run Lock Status, and Break Run Lock are grouped on the main action row beside Start Mosaic Stack and Resume Run. Abandon Run restores staged sources, removes temporary staging, and deletes checkpoint metadata; reports and logs are retained.
@@ -323,7 +326,7 @@ Create Cropped Master runs Siril only for the crop operation and writes a new FI
 Run History scans the selected output folder for quality_report_*.json files and lists status, input, stacked/rejected counts, integrated hours, and verification-artifact availability.
 
 SELECT AND COMPARE
-Select one report to make it the active source for the analysis tabs; those views refresh automatically. Select exactly two reports and Compare Selected to see frame and exposure deltas. The comparison is descriptive; it does not declare which run is scientifically better.
+Select one report to make it the active source for the analysis tabs; those views refresh automatically. Select exactly two reports and Compare Selected to see frame and exposure deltas. Export Experiment Record saves settings, runtime, output fingerprints, rejection diagnostics, a selected control run, and your conclusion. It requires matching selected-file content fingerprints and does not declare a winner.
 
 EXPORT
 Verify Selected performs the read-only audit. Export Selected Bundle creates the evidence ZIP. Export HTML Report creates a self-contained human-readable report with summary, verification, coverage, and settings tables.""",
@@ -355,7 +358,7 @@ Retention is stacked frames divided by total ledger frames for that cohort. It i
 USE FOR MIXED DATA
 Compare cohorts before choosing global thresholds. If one cohort loses disproportionate data, use Mosaic-aware star count, separate cohort export, or inspect that cohort's metrics directly.""",
     "Visual QA": """READ-ONLY DIAGNOSTICS
-Visual QA creates a preview-level diagnostic from the loaded master, coverage map, and crop. It never changes files.
+Open Visual QA from Run Review to create a preview-level diagnostic from the loaded master, coverage map, and crop. It never changes files.
 
 CHECKS
 It checks artifact readability, finite preview pixels, dynamic range, unusually dark edges, high black/clipped fraction, broad half-frame brightness differences, coverage-map holes, and crop dimensions.
@@ -790,6 +793,7 @@ class SirilMosaicApp:
         self.visual_qa_summary: tk.Text | None = None
         self.visual_qa_canvas: tk.Canvas | None = None
         self.visual_qa_photo: tk.PhotoImage | None = None
+        self.visual_qa_window: tk.Toplevel | None = None
         self.batch_tree: ttk.Treeview | None = None
         self.batch_jobs: list[dict[str, Any]] = []
         self.batch_running = False
@@ -908,6 +912,8 @@ class SirilMosaicApp:
         self.rejection_low = tk.DoubleVar(value=3.0)
         self.rejection_high = tk.DoubleVar(value=3.0)
         self.rejection_method = tk.StringVar(value="linear")
+        self.low_rejection_map = tk.StringVar(value="Follow method")
+        self.high_rejection_map = tk.StringVar(value="Follow method")
         self.fast_normalization = tk.BooleanVar(value=False)
         self.catalog = tk.StringVar(value="localgaia")
         self.memory = tk.DoubleVar(value=0.8)
@@ -970,7 +976,7 @@ class SirilMosaicApp:
         "Run Review": "Inspect a completed report, discarded frames, verification results, ledgers, bundles, and table filters.",
         "Threshold Lab": "Explore alternate keep-best targets against a recorded frame ledger without invoking Siril.",
         "Coverage Inspector": "Preview the saved integration-time map and inspect canvas, crop, and exposure statistics.",
-        "Visual QA": "Run non-destructive preview diagnostics for edges, clipping, broad gradients, coverage holes, and crop artifacts.",
+        "Visual QA": "Open read-only preview diagnostics from Run Review for edges, clipping, broad gradients, coverage holes, and crop artifacts.",
         "Cropping Workbench": "Preview and create alternate crops from an existing master without rerunning the stack.",
         "Run History": "Browse completed reports, compare runs, verify evidence, and export bundles or HTML reports.",
         "Quality Explorer": "Plot measured per-frame quality metrics and compare their distributions with recorded thresholds.",
@@ -991,10 +997,12 @@ class SirilMosaicApp:
         "Keep-best targets": "Target percentages for the interactive threshold replay. Higher values keep more frames and are less selective.",
         "Refresh History": "Rescan the selected output folder for completed quality reports.",
         "Compare Selected": "Compare exactly two selected reports by frame counts and integrated exposure.",
+        "Export Experiment Record": "Save a reproducible comparison of selected completed runs with identical selected input-file fingerprints.",
         "Verify Selected": "Run the read-only verifier against the selected history report.",
         "Export Selected Bundle": "Export the selected report's evidence bundle without raw lights.",
         "Export HTML Report": "Export the selected run as a self-contained HTML summary for sharing or archiving.",
         "Run Visual QA": "Run the preview-level visual diagnostics for the loaded report.",
+        "Run Visual QA...": "Open read-only preview diagnostics in a secondary window for the loaded report.",
         "Add Current": "Add the current input/output folder pair to the sequential batch queue.",
         "Add Folder": "Choose another input folder and add it to the batch queue with a default output folder.",
         "Remove Selected": "Remove selected queued jobs that are not currently running.",
@@ -1046,6 +1054,8 @@ class SirilMosaicApp:
         "Pixel rejection": "Per-pixel outlier rejection algorithm used during stacking. This rejects inconsistent pixel values, not whole frames.",
         "Low rejection": "Lower rejection parameter passed to the selected pixel rejection algorithm.",
         "High rejection": "Upper rejection parameter passed to the selected pixel rejection algorithm.",
+        "Low map": "Controls whether Siril's low-rejection map is requested and retained. Follow method follows the method's normal behavior; Always requests it when supported; Never omits it. Siril cannot create rejection maps when Pixel rejection is none, so that selection is reported unavailable. This does not change rejection thresholds.",
+        "High map": "Controls whether Siril's high-rejection map is requested and retained. Follow method follows the method's normal behavior; Always requests it when supported; Never omits it. Siril cannot create rejection maps when Pixel rejection is none, so that selection is reported unavailable. This does not change rejection thresholds.",
         "Normalize overlaps": "Normalizes brightness differences in overlapping mosaic regions. It can improve panel continuity but is expensive for large collections.",
         "Stack normalization": "Siril normalization mode used before combining frames. The choice affects brightness scaling and background behavior.",
         "Fast normalization": "Uses Siril's faster normalization path when available. It can reduce runtime with a possible quality tradeoff.",
@@ -1460,7 +1470,6 @@ class SirilMosaicApp:
         frame_tab = ttk.Frame(notebook)
         cohort_tab = ttk.Frame(notebook)
         coverage_tab = ttk.Frame(notebook)
-        visual_qa_tab = ttk.Frame(notebook)
         batch_tab = ttk.Frame(notebook)
         notebook.add(basic_tab, text="Basic")
         notebook.add(advanced_tab, text="Advanced")
@@ -1472,7 +1481,6 @@ class SirilMosaicApp:
         notebook.add(threshold_tab, text="Threshold Lab")
         notebook.add(frame_tab, text="Frame Inspector")
         notebook.add(coverage_tab, text="Coverage Inspector")
-        notebook.add(visual_qa_tab, text="Visual QA")
         notebook.add(crop_tab, text="Cropping Workbench")
         self._build_crop_workbench_tab(crop_tab)
         self._build_threshold_lab_tab(threshold_tab)
@@ -1481,7 +1489,6 @@ class SirilMosaicApp:
         self._build_frame_inspector_tab(frame_tab)
         self._build_cohort_balance_tab(cohort_tab)
         self._build_coverage_inspector_tab(coverage_tab)
-        self._build_visual_qa_tab(visual_qa_tab)
         self._build_batch_queue_tab(batch_tab)
         basic_tab.columnconfigure(0, weight=1)
         basic_tab.rowconfigure(0, weight=1)
@@ -1674,17 +1681,31 @@ class SirilMosaicApp:
         )
         self.rejection_widgets.extend((
             self._spinbox(integration, 2, 0, "Low rejection", self.rejection_low, 0.1, 20.0, 0.1),
-            self._spinbox(integration, 2, 1, "High rejection", self.rejection_high, 0.1, 20.0, 0.1),
+            self._spinbox(integration, 3, 0, "High rejection", self.rejection_high, 0.1, 20.0, 0.1),
         ))
+        for row, label, variable in (
+            (2, "Low map", self.low_rejection_map),
+            (3, "High map", self.high_rejection_map),
+        ):
+            ttk.Label(integration, text=label).grid(
+                row=row, column=2, sticky="w", padx=(0, 6), pady=4
+            )
+            ttk.Combobox(
+                integration,
+                textvariable=variable,
+                values=("Follow method", "Always", "Never"),
+                state="readonly",
+                width=13,
+            ).grid(row=row, column=3, sticky="ew", pady=4)
         overlap_check = ttk.Checkbutton(
             integration,
             text="Normalize overlaps",
             variable=self.overlap_normalization,
             command=self.update_normalization_controls,
         )
-        overlap_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
+        overlap_check.grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
         ttk.Label(integration, text="Stack normalization").grid(
-            row=3, column=0, sticky="w", padx=(0, 6), pady=4
+            row=4, column=0, sticky="w", padx=(0, 6), pady=4
         )
         ttk.Combobox(
             integration,
@@ -1692,29 +1713,29 @@ class SirilMosaicApp:
             values=STACK_NORMALIZATION_METHODS,
             state="readonly",
             width=13,
-        ).grid(row=3, column=1, sticky="ew", padx=(0, 16), pady=4)
+        ).grid(row=4, column=1, sticky="ew", padx=(0, 16), pady=4)
         self.fast_normalization_widget = ttk.Checkbutton(
             integration,
             text="Fast normalization",
             variable=self.fast_normalization,
         )
-        self.fast_normalization_widget.grid(row=4, column=2, columnspan=2, sticky="w", pady=4)
+        self.fast_normalization_widget.grid(row=5, column=2, columnspan=2, sticky="w", pady=4)
         coverage_check = ttk.Checkbutton(
             integration,
             text="Write coverage map",
             variable=self.coverage_map,
             command=self.update_coverage_controls,
         )
-        coverage_check.grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
+        coverage_check.grid(row=6, column=0, columnspan=2, sticky="w", pady=4)
         crop_check = ttk.Checkbutton(
             integration,
             text="Create auto-cropped master",
             variable=self.auto_crop_master,
             command=self.update_coverage_controls,
         )
-        crop_check.grid(row=5, column=2, columnspan=2, sticky="w", pady=4)
+        crop_check.grid(row=6, column=2, columnspan=2, sticky="w", pady=4)
         crop_percent = self._spinbox(
-            integration, 6, 0, "Crop depth (%)", self.auto_crop_coverage_percent, 1, 100, 1
+            integration, 7, 0, "Crop depth (%)", self.auto_crop_coverage_percent, 1, 100, 1
         )
         self.coverage_widgets.extend((coverage_check, crop_check, crop_percent))
         self.update_coverage_controls()
@@ -1971,6 +1992,17 @@ class SirilMosaicApp:
             text="Cleanup Review",
             command=self.show_cleanup_review,
         ).grid(row=0, column=6, sticky="w", padx=(8, 0))
+        visual_qa_bar = ttk.Frame(summary_frame)
+        visual_qa_bar.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(
+            visual_qa_bar,
+            text="Run Visual QA...",
+            command=self.open_visual_qa_window,
+        ).pack(side="left")
+        ttk.Label(
+            visual_qa_bar,
+            text="Read-only preview diagnostics",
+        ).pack(side="left", padx=(8, 0))
         self._set_review_summary("No completed run loaded.")
 
     def _set_text(self, widget: tk.Text | None, text: str) -> None:
@@ -2091,6 +2123,7 @@ class SirilMosaicApp:
         controls.grid(row=0, column=0, sticky="ew")
         ttk.Button(controls, text="Refresh History", command=self.refresh_history).pack(side="left")
         ttk.Button(controls, text="Compare Selected", command=self.compare_selected_history).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Export Experiment Record", command=self.export_experiment_record).pack(side="left", padx=(8, 0))
         ttk.Button(controls, text="Verify Selected", command=self.verify_selected_history).pack(side="left", padx=(8, 0))
         ttk.Button(controls, text="Export Selected Bundle", command=self.export_selected_history_bundle).pack(side="left", padx=(8, 0))
         ttk.Button(controls, text="Export HTML Report", command=self.export_selected_html_report).pack(side="left", padx=(8, 0))
@@ -2236,6 +2269,64 @@ class SirilMosaicApp:
             f"Integrated hours delta: {comparison['integrated_hours_delta']:+.3f}" if comparison['integrated_hours_delta'] is not None else "Integrated hours delta: unavailable",
         ]
         self._set_text(self.history_compare_text, "\n".join(text))
+
+    def export_experiment_record(self) -> None:
+        paths = self._history_selected_paths()
+        if len(paths) < 2:
+            messagebox.showwarning("Run History", "Select at least two completed runs.")
+            return
+        try:
+            reports = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+        except (OSError, json.JSONDecodeError) as error:
+            messagebox.showerror("Run History", f"Could not read selected reports:\n\n{error}")
+            return
+        run_ids = [report.get("run_id") or path.stem for path, report in zip(paths, reports)]
+        destination = filedialog.asksaveasfilename(
+            title="Export experiment comparison record",
+            initialfile=(
+                f"experiment_{run_ids[0]}_vs_{run_ids[1]}"
+                f"{'_plus_' + str(len(run_ids) - 2) if len(run_ids) > 2 else ''}.json"
+            ),
+            defaultextension=".json",
+            filetypes=(("JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not destination:
+            return
+        control_run_id = simpledialog.askstring(
+            "Experiment Control",
+            f"Enter the control run ID ({', '.join(run_ids)}):",
+            initialvalue=run_ids[0],
+            parent=self.root,
+        )
+        if control_run_id is None:
+            return
+        conclusion = simpledialog.askstring(
+            "Experiment Conclusion",
+            "Record your interpretation (leave blank if pending):",
+            initialvalue="",
+            parent=self.root,
+        )
+        if conclusion is None:
+            return
+        try:
+            record_path, record = write_experiment_record(
+                paths,
+                destination,
+                control_run_id=control_run_id.strip(),
+                conclusion=conclusion,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            messagebox.showerror("Run History", f"Could not export experiment record:\n\n{error}")
+            return
+        self._set_text(
+            self.history_compare_text,
+            "EXPERIMENT RECORD\n"
+            f"Runs: {', '.join(run_ids)}\n"
+            f"Control: {record['control_run_id']}\n"
+            f"Shared input identity: {record['input_identity']}\n"
+            f"Record: {record_path}",
+        )
+        self.status.set(f"Exported experiment record: {record_path}")
 
     def verify_selected_history(self) -> None:
         paths = self._history_selected_paths()
@@ -2634,6 +2725,38 @@ class SirilMosaicApp:
         self.visual_qa_summary = tk.Text(parent, height=12, wrap="word", state="disabled", background=DARK_FIELD, foreground=DARK_TEXT, relief="flat", font=("Consolas", 9))
         self.visual_qa_summary.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.refresh_visual_qa()
+
+    def open_visual_qa_window(self) -> None:
+        if self.visual_qa_window is not None:
+            try:
+                if self.visual_qa_window.winfo_exists():
+                    self.visual_qa_window.deiconify()
+                    self.visual_qa_window.lift()
+                    self.refresh_visual_qa()
+                    return
+            except tk.TclError:
+                pass
+        window = tk.Toplevel(self.root)
+        window.title("Visual QA")
+        window.geometry("900x700")
+        window.minsize(700, 540)
+        self.visual_qa_window = window
+        panel = ttk.Frame(window, padding=10)
+        panel.pack(fill="both", expand=True)
+        self._build_visual_qa_tab(panel)
+        window.protocol("WM_DELETE_WINDOW", self.close_visual_qa_window)
+
+    def close_visual_qa_window(self) -> None:
+        window = self.visual_qa_window
+        self.visual_qa_window = None
+        self.visual_qa_canvas = None
+        self.visual_qa_summary = None
+        self.visual_qa_photo = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
 
     def refresh_visual_qa(self) -> None:
         loaded = self._loaded_report()
@@ -3906,18 +4029,19 @@ class SirilMosaicApp:
         if not executable.is_file():
             messagebox.showerror("Cropping Workbench", "Choose an existing Siril executable.")
             return
+        output_path = self._next_crop_output_path(
+            Path(plan["master_path"]), int(plan["crop_coverage_percent"])
+        )
+        plan["output_path"] = str(output_path)
         output_path = Path(plan["output_path"])
-        command = [
-            sys.executable,
-            "-u",
-            str(Path(__file__).with_name("sirilmosaic.py")),
+        command = self._backend_command([
             "--crop-workbench",
             "--siril-exe", str(executable),
             "--crop-workbench-master", plan["master_path"],
             "--crop-workbench-coverage", plan["integration_time_path"],
             "--crop-workbench-percent", str(self.crop_percent.get()),
             "--crop-workbench-output", str(output_path),
-        ]
+        ])
         self._start_crop_operation(command, output_path)
 
     def create_crop(self) -> None:
@@ -4053,6 +4177,14 @@ class SirilMosaicApp:
         for substack in substacks:
             for frame in substack.get("discarded_frames", []):
                 discarded.append((substack, frame))
+        rejection_summaries = []
+        for substack in substacks:
+            diagnostics = (substack.get('stack') or {}).get('rejection_map_diagnostics')
+            if diagnostics:
+                rejection_summaries.append((f"Substack {substack.get('number', '?')}", diagnostics))
+        master_diagnostics = (report.get('master') or {}).get('rejection_map_diagnostics')
+        if master_diagnostics:
+            rejection_summaries.append(('Master', master_diagnostics))
         rejected = sum(frame.get("status") == "rejected" for _, frame in discarded)
         failed = sum(frame.get("status") == "failed" for _, frame in discarded)
         skipped = len(report.get("skipped_frames", []))
@@ -4080,6 +4212,23 @@ class SirilMosaicApp:
             f"Frame ledger: {report.get('frame_ledger_path', 'unavailable')}",
             f"Log: {self.log_path or 'unavailable'}",
         ]
+        summary_lines.append('Rejection-map diagnostics:')
+        if not rejection_summaries:
+            summary_lines.append('  unavailable (not recorded in this report)')
+        for label, diagnostics in rejection_summaries:
+            summary_lines.append(f"  {label}: {diagnostics.get('status', 'unknown')}")
+            for direction, result in (diagnostics.get('maps') or {}).items():
+                if result.get('status') != 'available':
+                    summary_lines.append(
+                        f"    {direction}: {result.get('reason', result.get('status', 'unavailable'))}"
+                    )
+                    continue
+                channel_text = ', '.join(
+                    f"ch {channel}: {stats['affected_pixel_locations']:,} locations "
+                    f"({stats['affected_pixel_percent']:.4f}%)"
+                    for channel, stats in result.get('channels', {}).items()
+                )
+                summary_lines.append(f"    {direction}: {channel_text or 'no channel metrics'}")
         if warnings:
             summary_lines.append("Warnings: " + " | ".join(str(warning) for warning in warnings))
         self._set_review_summary("\n".join(summary_lines))
@@ -4170,6 +4319,76 @@ class SirilMosaicApp:
         ttk.Button(dialog, text="Close", command=dialog.destroy).grid(
             row=1, column=0, pady=(0, 12)
         )
+
+    def show_completion_dialog(self, summary: str, output_dir: str | Path | None) -> tk.Toplevel:
+        dialog = tk.Toplevel(self.root)
+        configure_dark_theme(dialog)
+        dialog.title("Siril Mosaic Stacker")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        text = tk.Text(
+            dialog,
+            width=78,
+            height=18,
+            wrap="word",
+            padx=14,
+            pady=12,
+            background=DARK_FIELD,
+            foreground=DARK_TEXT,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        text.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        text.insert("1.0", summary)
+        text.configure(state="disabled")
+        style = ttk.Style(dialog)
+        style.configure(
+            "Completion.TButton",
+            background=DARK_SURFACE,
+            foreground=DARK_TEXT,
+            bordercolor=DARK_BORDER,
+            focuscolor="#3f86d9",
+            focusthickness=1,
+            padding=(8, 4),
+        )
+        style.map(
+            "Completion.TButton",
+            background=[("active", "#30343d"), ("pressed", DARK_FIELD)],
+            foreground=[("disabled", "#747b86")],
+        )
+        actions = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        actions.grid(row=1, column=0, sticky="e")
+        folder = Path(output_dir).expanduser() if output_dir else None
+        if folder is not None and folder.is_dir():
+            def open_folder() -> None:
+                try:
+                    if not folder.is_dir():
+                        raise FileNotFoundError(f"Output folder no longer exists: {folder}")
+                    if sys.platform == "win32":
+                        getattr(os, "startfile")(str(folder))
+                    else:
+                        opener = "open" if sys.platform == "darwin" else "xdg-open"
+                        subprocess.Popen([opener, str(folder)])
+                except OSError as error:
+                    messagebox.showerror(
+                        "Open Output Folder", f"Could not open {folder}:\n{error}", parent=dialog
+                    )
+
+            ttk.Button(
+                actions, text="Open Output Folder", command=open_folder,
+                style="Completion.TButton",
+            ).pack(
+                side="right", padx=(8, 0)
+            )
+        ttk.Button(
+            actions, text="Close", command=dialog.destroy, style="Completion.TButton"
+        ).pack(side="right")
+        dialog.update_idletasks()
+        dialog.minsize(560, 320)
+        dialog.resizable(True, True)
+        return dialog
 
     def _build_log(self) -> None:
         frame = ttk.Frame(self.root, padding=(14, 0, 14, 14))
@@ -4423,6 +4642,12 @@ class SirilMosaicApp:
                 state="normal" if self.overlap_normalization.get() else "disabled"
             )
 
+    @staticmethod
+    def _backend_command(arguments: list[str]) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--backend", *arguments]
+        return [sys.executable, "-u", str(Path(__file__).with_name("sirilmosaic.py")), *arguments]
+
     def command(self, allow_resume: bool = False) -> list[str]:
         workdir = Path(self.workdir.get().strip()).expanduser()
         output_dir = Path(self.output_dir.get().strip()).expanduser()
@@ -4514,13 +4739,9 @@ class SirilMosaicApp:
         if self.retries.get() < 0:
             raise ValueError("Retries cannot be negative.")
 
-        script = Path(__file__).with_name("sirilmosaic.py")
         bayer_pattern = "auto" if self.bayer_pattern.get() == "Auto (header)" else self.bayer_pattern.get()
         bayer_orientation = self.bayer_orientation.get().lower()
-        command = [
-            sys.executable,
-            "-u",
-            str(script),
+        command = self._backend_command([
             "--workdir", str(workdir),
             "--output-dir", str(output_dir),
             "--siril-exe", str(executable),
@@ -4569,10 +4790,17 @@ class SirilMosaicApp:
             "--auto-crop-master" if self.auto_crop_master.get() else "--no-auto-crop-master",
             "--auto-crop-coverage-percent", str(self.auto_crop_coverage_percent.get()),
             "--export-per-cohort" if self.export_per_cohort.get() else "--no-export-per-cohort",
-        ]
+        ])
         if self.export_per_cohort.get():
             for field in self._selected_cohort_group_fields():
                 command.extend(("--cohort-group-by", field))
+        for option, variable in (
+            ("--low-rejection-map", self.low_rejection_map),
+            ("--high-rejection-map", self.high_rejection_map),
+        ):
+            value = variable.get()
+            if value != "Follow method":
+                command.append(option if value == "Always" else f"--no-{option[2:]}")
         if self.plate_solve_radius.get().strip():
             command.extend(("--plate-solve-radius", self.plate_solve_radius.get().strip()))
         if self.plate_solve_limit_mag.get().strip():
@@ -5094,9 +5322,10 @@ class SirilMosaicApp:
                                 )
                             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                                 pass
-                        messagebox.showinfo(
-                            "Siril Mosaic Stacker",
+                        output_dir = self.output_dir.get().strip()
+                        self.show_completion_dialog(
                             completion_summary(report, self.quality_report_path, self.log_path),
+                            output_dir or None,
                         )
                     elif verification_failure:
                         self.progress_estimator.complete()
@@ -5164,4 +5393,8 @@ def launch_gui() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--backend":
+        from sirilmosaic import main as backend_main
+
+        raise SystemExit(backend_main(sys.argv[2:]))
     launch_gui()

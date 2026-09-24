@@ -1,12 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+import pysiril
+
+pysiril_lib = Path(pysiril.__file__).resolve().parent / 'lib'
+
 
 a = Analysis(
     ['sirilmosaic_gui.py'],
-    pathex=[],
+    pathex=[str(pysiril_lib)],
     binaries=[],
     datas=[('run_siril_mosaic.bat', '.')],
-    hiddenimports=[],
+    hiddenimports=['changelog', 'LogMsg', 'PipeReader', 'PipeWriter', 'ThreadSiril', 'tools'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

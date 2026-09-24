@@ -52,7 +52,9 @@ run_seed = None
 journal_warning_emitted = False
 run_lock_payload = None
 SUPPORTED_FRAME_SUFFIXES = {'.fit', '.fits', '.fts', '.xisf'}
-GENERATED_DIRECTORIES = {'lights_sorted', 'substacks', 'rejects', '__pycache__'}
+GENERATED_DIRECTORIES = {
+    'lights_sorted', 'substacks', 'rejects', 'siril mosaic output', '__pycache__'
+}
 GENERATED_FILE_PREFIXES = ('master_stack', 'substack_')
 SOURCE_MANIFEST = 'source_manifest.json'
 REJECTS_DIRECTORY = 'rejects'
@@ -132,12 +134,14 @@ feather_val = '20'  # Blends field rotation edges (S50)
 rej_low = '3.0'     # Sigma for dark pixel rejection
 rej_high = '3.0'    # Sigma for bright pixel rejection (satellites)
 pixel_rejection_method = 'linear'
+low_rejection_map_enabled = None
+high_rejection_map_enabled = None
 fast_normalization = False
 catalog = 'localgaia'
 memory_fraction = '0.8'
 cpu_count = 28
 siril_open_timeout = 60.0
-siril_command_timeout = 14400.0
+siril_command_timeout = 0.0
 siril_unresponsive = False
 siril_version_text = 'unavailable'
 siril_version_tuple = None
@@ -2032,6 +2036,8 @@ def runtime_settings():
         'rejection_low': rej_low,
         'rejection_high': rej_high,
         'pixel_rejection_method': pixel_rejection_method,
+        'low_rejection_map': low_rejection_map_enabled,
+        'high_rejection_map': high_rejection_map_enabled,
         'fast_normalization': fast_normalization,
         'skip_failed_frames': skip_failed_frames,
         'mosaic_aware_star_count': mosaic_aware_star_count,
@@ -2071,7 +2077,10 @@ def apply_runtime_settings(settings):
         'background_method': 'background_method', 'background_samples': 'background_samples',
         'background_tolerance': 'background_tolerance', 'stacking_weight': 'stacking_weight',
         'feather': 'feather_val', 'rejection_low': 'rej_low', 'rejection_high': 'rej_high',
-        'pixel_rejection_method': 'pixel_rejection_method', 'fast_normalization': 'fast_normalization',
+        'pixel_rejection_method': 'pixel_rejection_method',
+        'low_rejection_map': 'low_rejection_map_enabled',
+        'high_rejection_map': 'high_rejection_map_enabled',
+        'fast_normalization': 'fast_normalization',
         'skip_failed_frames': 'skip_failed_frames', 'mosaic_aware_star_count': 'mosaic_aware_star_count',
         'sky_quality_percent': 'sky_quality_percent', 'catalog': 'catalog',
         'memory_fraction': 'memory_fraction', 'cpu_count': 'cpu_count',
@@ -2319,7 +2328,282 @@ def parse_stack_quality(lines):
             "height": int(dimensions.group(3)),
             "bits_per_channel": int(dimensions.group(4)),
         }
+    summary['rejection_diagnostics'] = summarize_rejection_diagnostics(
+        summary['pixel_rejection_percent'],
+        (summary.get('output') or {}).get('channels'),
+    )
     return summary
+
+
+def summarize_rejection_diagnostics(pixel_rejection_percent, expected_channels=None):
+    channels = {
+        str(channel): values
+        for channel, values in pixel_rejection_percent.items()
+        if isinstance(values, dict)
+        and all(
+            isinstance(values.get(direction), (int, float))
+            and math.isfinite(values[direction])
+            for direction in ('low', 'high')
+        )
+    }
+    if not channels:
+        return {
+            'status': 'unavailable',
+            'reason': 'Siril did not report per-channel rejection percentages.',
+            'channel_count': 0,
+            'channel_imbalance_percentage_points': {},
+            'rejected_pixel_counts': {
+                'status': 'unavailable',
+                'reason': 'Siril output has no rejected-sample denominator.',
+            },
+            'blank_sky_background_and_noise': {
+                'status': 'unavailable',
+                'reason': 'No blank-sky region or mask is available in the stack log.',
+            },
+            'residual_hot_cold_pixel_indicators': {
+                'status': 'unavailable',
+                'reason': 'No defect reference or calibrated residual measurement is available.',
+            },
+        }
+
+    expected = (
+        {str(index) for index in range(expected_channels)}
+        if isinstance(expected_channels, int) and expected_channels > 0
+        else set(channels)
+    )
+    missing = sorted(expected - channels.keys(), key=lambda value: int(value))
+    unexpected = sorted(channels.keys() - expected, key=lambda value: int(value))
+    by_direction = {}
+    for direction in ('low', 'high'):
+        values = [channel[direction] for channel in channels.values()]
+        minimum = min(values)
+        maximum = max(values)
+        by_direction[direction] = {
+            'minimum_percent': minimum,
+            'maximum_percent': maximum,
+            'range_percentage_points': round(maximum - minimum, 6),
+        }
+    return {
+        'status': 'partial' if missing or unexpected else 'available',
+        'source': 'siril_stack_log',
+        'channel_count': len(channels),
+        'expected_channel_count': len(expected),
+        'missing_channels': missing,
+        'unexpected_channels': unexpected,
+        'channel_imbalance_percentage_points': by_direction,
+        'rejected_pixel_counts': {
+            'status': 'unavailable',
+            'reason': 'Siril output has no rejected-sample denominator.',
+        },
+        'blank_sky_background_and_noise': {
+            'status': 'unavailable',
+            'reason': 'No blank-sky region or mask is available in the stack log.',
+        },
+        'residual_hot_cold_pixel_indicators': {
+            'status': 'unavailable',
+            'reason': 'No defect reference or calibrated residual measurement is available.',
+        },
+    }
+
+
+def rejection_map_requests(
+    method,
+    low_configured=None,
+    high_configured=None,
+    master=False,
+    use_master_rejection=True,
+):
+    follows_method = method != 'none' and (not master or use_master_rejection)
+    return {
+        'low': follows_method if low_configured is None else bool(low_configured),
+        'high': follows_method if high_configured is None else bool(high_configured),
+    }
+
+
+def remove_unrequested_rejection_maps(directory, stem, requested):
+    for direction, is_requested in requested.items():
+        if not is_requested:
+            (Path(directory) / f'{stem}_{direction}_rejmap.fit').unlink(missing_ok=True)
+
+
+def summarize_rejection_map(path, chunk_pixels=1_048_576):
+    path = Path(path)
+    bitpix_types = {8: '>u1', 16: '>i2', 32: '>i4', -32: '>f4', -64: '>f8'}
+    header = {}
+    with path.open('rb') as stream:
+        while True:
+            block = stream.read(2880)
+            if len(block) != 2880:
+                raise ValueError(f'Rejection-map FITS header is incomplete: {path}')
+            found_end = False
+            for offset in range(0, 2880, 80):
+                card = block[offset:offset + 80].decode('ascii', errors='replace')
+                name = card[:8].strip().upper()
+                if name == 'END':
+                    found_end = True
+                    break
+                if card[8:10] == '= ' and name in {
+                    'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'NAXIS3',
+                }:
+                    try:
+                        header[name] = int(_clean_fits_value(card[10:]))
+                    except ValueError as error:
+                        raise ValueError(f'Invalid {name} in rejection-map FITS: {path}') from error
+            if found_end:
+                break
+
+        dimensions = header.get('NAXIS')
+        if dimensions not in (2, 3):
+            raise ValueError(f'Unsupported rejection-map FITS dimensions: {path}')
+        bitpix = header.get('BITPIX')
+        dtype = bitpix_types.get(bitpix)
+        if dtype is None:
+            raise ValueError(f'Unsupported rejection-map FITS bit depth: {bitpix}')
+        width = header.get('NAXIS1', 0)
+        height = header.get('NAXIS2', 0)
+        channels = header.get('NAXIS3', 1) if dimensions == 3 else 1
+        if min(width, height, channels) < 1 or chunk_pixels < 1:
+            raise ValueError(f'Invalid rejection-map FITS dimensions or chunk size: {path}')
+
+        plane_pixels = width * height
+        spatial_grid_size = 4
+        channel_stats = {}
+        for channel in range(channels):
+            finite_pixels = 0
+            affected_pixels = 0
+            map_value_sum = 0.0
+            max_map_value = None
+            spatial_finite = np.zeros(spatial_grid_size * spatial_grid_size, dtype=np.int64)
+            spatial_affected = np.zeros_like(spatial_finite)
+            pixels_read = 0
+            while pixels_read < plane_pixels:
+                count = min(chunk_pixels, plane_pixels - pixels_read)
+                values = np.fromfile(stream, dtype=dtype, count=count)
+                if values.size != count:
+                    raise ValueError(f'Rejection-map FITS data is incomplete: {path}')
+                finite = np.isfinite(values)
+                finite_values = values[finite]
+                positive = finite_values > 0
+                finite_pixels += int(finite_values.size)
+                affected_pixels += int(np.count_nonzero(positive))
+                pixel_indices = np.arange(pixels_read, pixels_read + count, dtype=np.int64)
+                tile_rows = np.minimum(
+                    (pixel_indices // width) * spatial_grid_size // height,
+                    spatial_grid_size - 1,
+                )
+                tile_columns = np.minimum(
+                    (pixel_indices % width) * spatial_grid_size // width,
+                    spatial_grid_size - 1,
+                )
+                tile_indices = tile_rows * spatial_grid_size + tile_columns
+                spatial_finite += np.bincount(
+                    tile_indices[finite], minlength=spatial_grid_size * spatial_grid_size
+                )
+                spatial_affected += np.bincount(
+                    tile_indices[finite & (values > 0)],
+                    minlength=spatial_grid_size * spatial_grid_size,
+                )
+                if finite_values.size:
+                    map_value_sum += float(np.sum(finite_values, dtype=np.float64))
+                    chunk_max = float(np.max(finite_values))
+                    max_map_value = chunk_max if max_map_value is None else max(max_map_value, chunk_max)
+                pixels_read += count
+            if finite_pixels == 0:
+                raise ValueError(f'Rejection-map channel {channel} has no finite pixels: {path}')
+            active_tiles = np.flatnonzero(spatial_finite)
+            tile_rates = spatial_affected[active_tiles] / spatial_finite[active_tiles]
+            hotspot_position = int(np.argmax(tile_rates))
+            hotspot_tile = int(active_tiles[hotspot_position])
+            overall_rate = affected_pixels / finite_pixels
+            hotspot_rate = float(tile_rates[hotspot_position])
+            spatial_concentration = {
+                'grid_rows': spatial_grid_size,
+                'grid_columns': spatial_grid_size,
+                'overall_affected_pixel_percent': round(overall_rate * 100, 6),
+                'maximum_tile_affected_pixel_percent': round(hotspot_rate * 100, 6),
+                'maximum_tile_to_overall_rate_ratio': (
+                    round(hotspot_rate / overall_rate, 6) if overall_rate > 0 else None
+                ),
+                'maximum_tile': {
+                    'row': hotspot_tile // spatial_grid_size,
+                    'column': hotspot_tile % spatial_grid_size,
+                    'affected_pixel_locations': int(spatial_affected[hotspot_tile]),
+                    'finite_pixel_locations': int(spatial_finite[hotspot_tile]),
+                },
+                'tile_affected_pixel_percent': [
+                    round(int(spatial_affected[tile]) * 100 / int(spatial_finite[tile]), 6)
+                    if spatial_finite[tile] else None
+                    for tile in range(spatial_grid_size * spatial_grid_size)
+                ],
+            }
+            channel_stats[str(channel)] = {
+                'pixel_locations': plane_pixels,
+                'finite_pixel_locations': finite_pixels,
+                'affected_pixel_locations': affected_pixels,
+                'affected_pixel_percent': round(affected_pixels * 100 / finite_pixels, 6),
+                'mean_map_value': map_value_sum / finite_pixels,
+                'max_map_value': max_map_value,
+                'spatial_concentration': spatial_concentration,
+            }
+
+    return {
+        'status': 'available',
+        'file': path.name,
+        'width': width,
+        'height': height,
+        'channels': channel_stats,
+    }
+
+
+def rejection_map_diagnostics(map_paths, requested, unavailable_reason=None):
+    requested_by_direction = (
+        requested if isinstance(requested, dict)
+        else {direction: bool(requested) for direction in ('low', 'high')}
+    )
+    if not any(requested_by_direction.values()):
+        return {
+            'status': 'unavailable',
+            'reason': 'maps_not_requested',
+            'maps': {
+                direction: {'status': 'not_requested'}
+                for direction in ('low', 'high')
+            },
+        }
+
+    maps = {}
+    for direction in ('low', 'high'):
+        if not requested_by_direction.get(direction, False):
+            maps[direction] = {'status': 'not_requested'}
+            continue
+        if unavailable_reason is not None:
+            maps[direction] = {
+                'status': 'unavailable',
+                'reason': unavailable_reason,
+            }
+            continue
+        path = map_paths.get(direction)
+        if path is None or not Path(path).is_file():
+            maps[direction] = {'status': 'unavailable', 'reason': 'map_missing'}
+            continue
+        try:
+            maps[direction] = summarize_rejection_map(path)
+        except Exception as error:
+            maps[direction] = {
+                'status': 'unavailable',
+                'file': Path(path).name,
+                'reason': 'map_unreadable',
+                'detail': str(error),
+            }
+
+    requested_count = sum(requested_by_direction.values())
+    available_count = sum(
+        maps[direction]['status'] == 'available'
+        for direction in ('low', 'high') if requested_by_direction.get(direction, False)
+    )
+    status = 'available' if available_count == requested_count else (
+        'partial' if available_count else 'unavailable'
+    )
+    return {'status': status, 'maps': maps}
 
 
 def count_sequence_files(folder, sequence_name):
@@ -3170,6 +3454,301 @@ def build_artifact_inventory(report):
     return inventory
 
 
+def _stack_rejection_diagnostics(stack):
+    stack = stack or {}
+    return stack.get('rejection_diagnostics') or summarize_rejection_diagnostics(
+        stack.get('pixel_rejection_percent') or {},
+        (stack.get('output') or {}).get('channels'),
+    )
+
+
+def _numeric_delta(candidate, control):
+    if (
+        isinstance(candidate, (int, float))
+        and isinstance(control, (int, float))
+        and math.isfinite(candidate)
+        and math.isfinite(control)
+    ):
+        return round(candidate - control, 6)
+    return None
+
+
+def _compare_rejection_stack(candidate, control):
+    candidate_percent = candidate.get('pixel_rejection_percent') or {}
+    control_percent = control.get('pixel_rejection_percent') or {}
+    channel_deltas = {}
+    for channel in sorted(candidate_percent.keys() & control_percent.keys(), key=str):
+        channel_deltas[channel] = {
+            direction: _numeric_delta(
+                (candidate_percent[channel] or {}).get(direction),
+                (control_percent[channel] or {}).get(direction),
+            )
+            for direction in ('low', 'high')
+        }
+
+    candidate_imbalance = (
+        candidate.get('rejection_diagnostics') or {}
+    ).get('channel_imbalance_percentage_points') or {}
+    control_imbalance = (
+        control.get('rejection_diagnostics') or {}
+    ).get('channel_imbalance_percentage_points') or {}
+    imbalance_deltas = {
+        direction: _numeric_delta(
+            (candidate_imbalance.get(direction) or {}).get('range_percentage_points'),
+            (control_imbalance.get(direction) or {}).get('range_percentage_points'),
+        )
+        for direction in ('low', 'high')
+    }
+
+    map_deltas = {}
+    candidate_maps = candidate.get('maps') or {}
+    control_maps = control.get('maps') or {}
+    for direction in ('low', 'high'):
+        candidate_channels = (candidate_maps.get(direction) or {}).get('channels') or {}
+        control_channels = (control_maps.get(direction) or {}).get('channels') or {}
+        channel_map_deltas = {}
+        for channel in sorted(candidate_channels.keys() & control_channels.keys(), key=str):
+            candidate_map_channel = candidate_channels[channel]
+            control_map_channel = control_channels[channel]
+            candidate_spatial = candidate_map_channel.get('spatial_concentration') or {}
+            control_spatial = control_map_channel.get('spatial_concentration') or {}
+            tile_deltas = None
+            candidate_tiles = candidate_spatial.get('tile_affected_pixel_percent')
+            control_tiles = control_spatial.get('tile_affected_pixel_percent')
+            if (
+                isinstance(candidate_tiles, list)
+                and isinstance(control_tiles, list)
+                and len(candidate_tiles) == len(control_tiles)
+            ):
+                tile_deltas = [
+                    _numeric_delta(candidate_value, control_value)
+                    for candidate_value, control_value in zip(candidate_tiles, control_tiles)
+                ]
+            channel_map_deltas[channel] = {
+                'affected_pixel_percent': _numeric_delta(
+                    candidate_map_channel.get('affected_pixel_percent'),
+                    control_map_channel.get('affected_pixel_percent'),
+                ),
+                'maximum_tile_affected_pixel_percent': _numeric_delta(
+                    candidate_spatial.get('maximum_tile_affected_pixel_percent'),
+                    control_spatial.get('maximum_tile_affected_pixel_percent'),
+                ),
+                'maximum_tile_to_overall_rate_ratio': _numeric_delta(
+                    candidate_spatial.get('maximum_tile_to_overall_rate_ratio'),
+                    control_spatial.get('maximum_tile_to_overall_rate_ratio'),
+                ),
+                'tile_affected_pixel_percent': tile_deltas,
+            }
+        if channel_map_deltas:
+            map_deltas[direction] = channel_map_deltas
+
+    has_comparison = bool(channel_deltas) or any(
+        value is not None for value in imbalance_deltas.values()
+    ) or bool(map_deltas)
+    return {
+        'status': 'available' if has_comparison else 'unavailable',
+        **({} if has_comparison else {'reason': 'No matching numeric rejection measurements are available.'}),
+        'pixel_rejection_percent_delta': channel_deltas,
+        'channel_imbalance_percentage_points_delta': imbalance_deltas,
+        'rejection_map_delta': map_deltas,
+    }
+
+
+def _compare_rejection_runs(candidate_run, control_run):
+    candidate = candidate_run.get('rejection_diagnostics') or {}
+    control = control_run.get('rejection_diagnostics') or {}
+    control_substacks = {
+        (item.get('number'), item.get('cohort')): item
+        for item in control.get('substacks', [])
+    }
+    substack_deltas = []
+    for item in candidate.get('substacks', []):
+        key = (item.get('number'), item.get('cohort'))
+        control_item = control_substacks.get(key)
+        if control_item is None:
+            substack_deltas.append({
+                'number': item.get('number'),
+                'cohort': item.get('cohort'),
+                'status': 'unavailable',
+                'reason': 'No matching control substack and cohort.',
+            })
+            continue
+        substack_deltas.append({
+            'number': item.get('number'),
+            'cohort': item.get('cohort'),
+            **_compare_rejection_stack(item, control_item),
+        })
+    return {
+        'control_run_id': control_run.get('run_id'),
+        'substacks': substack_deltas,
+        'master': _compare_rejection_stack(
+            candidate.get('master') or {}, control.get('master') or {}
+        ),
+    }
+
+
+def _experiment_run_record(report_path):
+    report_path = Path(report_path).expanduser().resolve()
+    if not report_path.is_file():
+        raise FileNotFoundError(f'Quality report does not exist: {report_path}')
+    try:
+        report = json.loads(report_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f'Could not read quality report: {report_path} ({error})') from error
+    if report.get('status') != 'complete':
+        raise ValueError(f'Experiment comparisons require completed runs: {report_path}')
+
+    manifest_path = _verification_path(report_path, report.get('input_manifest'))
+    if manifest_path is None or not manifest_path.is_file():
+        raise ValueError(f'Input manifest is missing for run {report.get("run_id", report_path.stem)}.')
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f'Could not read input manifest: {manifest_path} ({error})') from error
+    selected_files = manifest.get('selected_files')
+    if not isinstance(selected_files, list) or not selected_files:
+        raise ValueError(f'Input manifest has no selected-file fingerprints: {manifest_path}')
+
+    identity_entries = []
+    for entry in selected_files:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get('sha256'), str)
+            or len(entry['sha256']) != 64
+            or not isinstance(entry.get('size'), int)
+            or entry['size'] < 0
+        ):
+            raise ValueError(f'Input manifest contains an invalid file fingerprint: {manifest_path}')
+        identity_entries.append((entry['sha256'].lower(), entry['size']))
+    identity_entries.sort()
+    input_identity = hashlib.sha256(
+        json.dumps(identity_entries, separators=(',', ':')).encode('ascii')
+    ).hexdigest()
+
+    runtime_seconds = None
+    try:
+        started = datetime.fromisoformat(report['started_at'])
+        finished = datetime.fromisoformat(report['updated_at'])
+        runtime_seconds = max(0.0, (finished - started).total_seconds())
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    artifact_inventory = list(report.get('artifact_inventory') or [])
+    recorded_artifacts = {
+        (entry.get('role'), entry.get('path'))
+        for entry in artifact_inventory
+        if isinstance(entry, dict)
+    }
+    for entry in build_artifact_inventory(report):
+        identity = (entry['role'], entry['path'])
+        if identity not in recorded_artifacts:
+            artifact_inventory.append(entry)
+            recorded_artifacts.add(identity)
+    for master in report.get('masters') or ([report.get('master', {})] if report.get('master') else []):
+        master_value = master.get('path')
+        if not master_value:
+            continue
+        master_path = Path(master_value)
+        for direction in ('low', 'high'):
+            map_path = master_path.with_name(f'{master_path.stem}_{direction}_rejmap.fit')
+            identity = (f'rejection_map_{direction}', str(map_path))
+            if identity in recorded_artifacts or not map_path.is_file():
+                continue
+            width, height = _read_fits_dimensions(map_path)
+            artifact_inventory.append({
+                'role': identity[0],
+                'path': str(map_path),
+                'bytes': map_path.stat().st_size,
+                'width': width,
+                'height': height,
+                'sha256': _sha256_file(map_path),
+                **({'cohort': master['cohort']} if master.get('cohort') else {}),
+            })
+    outputs = [
+        {
+            key: entry[key]
+            for key in ('role', 'path', 'bytes', 'width', 'height', 'sha256', 'cohort')
+            if key in entry
+        }
+        for entry in artifact_inventory
+    ]
+    return {
+        'run_id': report.get('run_id') or report_path.stem,
+        'report_path': str(report_path),
+        'input_identity': input_identity,
+        'input_frames': len(identity_entries),
+        'settings': report.get('settings') or {},
+        'configuration_hash': report.get('configuration_hash'),
+        'seed': report.get('seed'),
+        'runtime_seconds': runtime_seconds,
+        'output_identities': outputs,
+        'rejection_diagnostics': {
+            'substacks': [
+                {
+                    'number': substack.get('number'),
+                    'cohort': substack.get('cohort'),
+                    **((substack.get('stack') or {}).get('rejection_map_diagnostics') or {}),
+                    'pixel_rejection_percent': (substack.get('stack') or {}).get('pixel_rejection_percent', {}),
+                    'rejection_diagnostics': _stack_rejection_diagnostics(substack.get('stack')),
+                }
+                for substack in report.get('substacks', [])
+            ],
+            'master': {
+                **((report.get('master') or {}).get('rejection_map_diagnostics') or {}),
+                'pixel_rejection_percent': (report.get('master') or {}).get('pixel_rejection_percent', {}),
+                'rejection_diagnostics': _stack_rejection_diagnostics(report.get('master')),
+            },
+        },
+    }
+
+
+def build_experiment_record(report_paths, control_run_id=None, conclusion=''):
+    if len(report_paths) < 2:
+        raise ValueError('An experiment comparison requires at least two completed run reports.')
+    runs = [_experiment_run_record(path) for path in report_paths]
+    run_ids = [run['run_id'] for run in runs]
+    if len(run_ids) != len(set(run_ids)):
+        raise ValueError('An experiment comparison cannot include the same run more than once.')
+    identities = {run['input_identity'] for run in runs}
+    if len(identities) != 1:
+        raise ValueError('Runs do not use the same selected input-file identities.')
+    if control_run_id is not None and control_run_id not in run_ids:
+        raise ValueError('The selected control run must be one of the compared runs.')
+    for run in runs:
+        if not any(
+            entry.get('role') == 'master' and entry.get('sha256')
+            for entry in run['output_identities']
+        ):
+            raise ValueError(
+                f'No readable master output fingerprint is available for run {run["run_id"]}.'
+            )
+    control = next((run for run in runs if run['run_id'] == control_run_id), None)
+    for run in runs:
+        run['control_comparison'] = (
+            {'status': 'control_run', 'control_run_id': control_run_id}
+            if run is control
+            else _compare_rejection_runs(run, control)
+            if control is not None
+            else {'status': 'unavailable', 'reason': 'No control run was selected.'}
+        )
+    return {
+        'schema_version': 1,
+        'created_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        'input_identity': runs[0]['input_identity'],
+        'input_frames': runs[0]['input_frames'],
+        'control_run_id': control_run_id,
+        'conclusion': str(conclusion).strip(),
+        'runs': runs,
+    }
+
+
+def write_experiment_record(report_paths, destination, control_run_id=None, conclusion=''):
+    record = build_experiment_record(report_paths, control_run_id, conclusion)
+    destination = Path(destination).expanduser().resolve()
+    _atomic_write_text(destination, json.dumps(record, indent=2))
+    return destination, record
+
+
 def scan_input_integrity(
     root_folder,
     output_dir=None,
@@ -3839,6 +4418,34 @@ def _write_coverage_fits(path, coverage, unit='frame', extra_cards=None):
     _atomic_write_bytes(path, header + data)
 
 
+def _coverage_edge_allowance_pixels():
+    interpolation_support = {
+        'none': 0,
+        'nearest': 1,
+        'linear': 1,
+        'cubic': 2,
+        'lanczos4': 4,
+        'area': 4,
+    }.get(registration_interpolation, 4)
+    return math.ceil(max(0.0, float(feather_val))) + interpolation_support + 1
+
+
+def _dilate_coverage_support(covered, radius):
+    if radius <= 0 or not np.any(covered):
+        return covered
+    height, width = covered.shape
+    radius = min(radius, max(height, width))
+    horizontal = covered.copy()
+    for offset in range(1, min(radius, width - 1) + 1):
+        horizontal[:, offset:] |= covered[:, :-offset]
+        horizontal[:, :-offset] |= covered[:, offset:]
+    expanded = horizontal.copy()
+    for offset in range(1, min(radius, height - 1) + 1):
+        expanded[offset:, :] |= horizontal[:-offset, :]
+        expanded[:-offset, :] |= horizontal[offset:, :]
+    return expanded
+
+
 def finalize_coverage_maps(master_path, coverage_report):
     if not coverage_report or coverage_report.get('status') == 'unavailable':
         return coverage_report
@@ -3858,11 +4465,21 @@ def finalize_coverage_maps(master_path, coverage_report):
     footprint = _fill_drizzle_footprint(master_support) if drizzle_enabled else master_support
     integration[~footprint] = 0
     covered = np.isfinite(integration) & (integration > 0)
-    signal_outside = int(np.count_nonzero(master_support & ~covered))
+    uncovered_signal = master_support & ~covered
+    signal_outside = int(np.count_nonzero(uncovered_signal))
     coverage_outside = int(np.count_nonzero(covered & ~footprint))
+    edge_allowance = _coverage_edge_allowance_pixels()
     if signal_outside:
+        edge_support = _dilate_coverage_support(covered, edge_allowance)
+        edge_signal = uncovered_signal & edge_support
+        unexplained_signal = int(np.count_nonzero(uncovered_signal & ~edge_support))
+    else:
+        edge_signal = uncovered_signal
+        unexplained_signal = 0
+    if unexplained_signal:
         raise ValueError(
-            f'Coverage map misses {signal_outside} nonzero master pixel(s); refusing to finalize.'
+            f'Coverage map misses {unexplained_signal} nonzero master pixel(s) beyond the '
+            f'configured {edge_allowance}-pixel feather/interpolation fringe; refusing to finalize.'
         )
     maximum = float(integration.max())
     wcs_cards = _celestial_wcs_cards(master_path)
@@ -3880,6 +4497,13 @@ def finalize_coverage_maps(master_path, coverage_report):
         'master_signal_pixels': int(np.count_nonzero(master_support)),
         'coverage_footprint_pixels': int(np.count_nonzero(covered)),
         'master_signal_outside_coverage_pixels': signal_outside,
+        'master_signal_outside_coverage_edge_pixels': int(np.count_nonzero(edge_signal)),
+        'master_signal_outside_coverage_unexplained_pixels': unexplained_signal,
+        'coverage_edge_allowance_pixels': edge_allowance,
+        'coverage_edge_allowance_basis': (
+            f'{feather_val}px feather + {registration_interpolation} interpolation support + '
+            '1px nearest-neighbor grid allowance'
+        ),
         'coverage_outside_master_footprint_pixels': coverage_outside,
         'footprint_model': 'filled drizzle detector footprint' if drizzle_enabled else 'finite nonzero master pixels',
         'wcs_status': 'copied' if wcs_cards else 'unavailable',
@@ -4603,14 +5227,24 @@ def substack(group_num, cat=None):
         "rej none" if pixel_rejection_method == 'none'
         else f"rej {pixel_rejection_method} {rej_low} {rej_high}"
     )
+    substack_map_requests = rejection_map_requests(
+        pixel_rejection_method,
+        low_rejection_map_enabled,
+        high_rejection_map_enabled,
+    )
     stack_response = execute_siril(
         f"stack r_{background_sequence} {rejection_command} "
         f"-weight={stacking_weight} "
         f"-norm={stack_normalization}{' -overlap_norm' if overlap_normalization else ''} "
         f"-feather={feather_val} "
         f"-rgb_equal -output_norm"
-        f"{' -rejmaps' if pixel_rejection_method != 'none' else ''} -maximize"
+        f"{' -rejmaps' if pixel_rejection_method != 'none' and any(substack_map_requests.values()) else ''} -maximize"
         f"{' -fastnorm' if fast_normalization else ''} -out=../substack_{group_num}"
+    )
+    remove_unrequested_rejection_maps(
+        group_path,
+        f'substack_{group_num}',
+        substack_map_requests,
     )
     stacked_count = parse_stack_quality(stack_response).get("stacked_frames", len(files))
     phase(
@@ -4626,6 +5260,16 @@ def substack(group_num, cat=None):
         if active_cohort_id is not None:
             substack_report["cohort"] = active_cohort_id
         substack_report["stack"] = parse_stack_quality(stack_response)
+        substack_report['stack']['rejection_map_diagnostics'] = rejection_map_diagnostics(
+            {
+                direction: group_path / f'substack_{group_num}_{direction}_rejmap.fit'
+                for direction in ('low', 'high')
+            },
+            requested=substack_map_requests,
+            unavailable_reason=(
+                'rejection_disabled' if pixel_rejection_method == 'none' else None
+            ),
+        )
         substack_report["stage_counts"] = summarize_substack_stages(
             process_folder,
             files,
@@ -4693,11 +5337,19 @@ def masterstack(SubStack_nb):
     if SubStack_nb == 1:
         report_progress(91, 98, "Creating master stack")
         shutil.copy2(lights_folder / "substack_1.fit", master_stack_path())
+        master_map_paths = {}
         for rejection_map in rejection_maps_folder.glob("substack_1_*rejmap.fit"):
             master_name = rejection_map.name.replace(
                 "substack_1_", f"{master_stack_path().stem}_", 1
             )
-            shutil.copy2(rejection_map, output_dir / master_name)
+            destination = output_dir / master_name
+            shutil.copy2(rejection_map, destination)
+            direction = next(
+                (value for value in ('low', 'high') if master_name.lower().endswith(f'_{value}_rejmap.fit')),
+                None,
+            )
+            if direction is not None:
+                master_map_paths[direction] = destination
         artifact = require_siril_artifact(master_stack_path(), 'Master stack artifact')
         if quality_report is not None:
             quality_report["master"] = {
@@ -4710,6 +5362,17 @@ def masterstack(SubStack_nb):
                 "path": str(master_stack_path()),
                 "weight": stacking_weight,
                 "rejection": pixel_rejection_method,
+                'rejection_map_diagnostics': rejection_map_diagnostics(
+                    master_map_paths,
+                    requested=rejection_map_requests(
+                        pixel_rejection_method,
+                        low_rejection_map_enabled,
+                        high_rejection_map_enabled,
+                    ),
+                    unavailable_reason=(
+                        'rejection_disabled' if pixel_rejection_method == 'none' else None
+                    ),
+                ),
             }
             quality_report.setdefault('artifact_postconditions', []).append(artifact)
             finalize_coverage_maps(master_stack_path(), quality_report.get('coverage'))
@@ -4745,22 +5408,40 @@ def masterstack(SubStack_nb):
         master_rejection = f"rej {pixel_rejection_method} {rej_low} {rej_high}"
     else:
         master_rejection = "rej none"
+    master_map_requests = rejection_map_requests(
+        pixel_rejection_method,
+        low_rejection_map_enabled,
+        high_rejection_map_enabled,
+        master=True,
+        use_master_rejection=use_master_rejection,
+    )
     master_response = execute_siril(
         f"stack r_pp_light {master_rejection} "
         f"-weight=nbstack "
         f"-norm={stack_normalization}{' -overlap_norm' if overlap_normalization else ''} "
         f"-feather={feather_val} "
         f"-rgb_equal -output_norm"
-        f"{' -rejmaps' if use_master_rejection and pixel_rejection_method != 'none' else ''} -maximize"
+        f"{' -rejmaps' if pixel_rejection_method != 'none' and any(master_map_requests.values()) else ''} -maximize"
         f"{' -fastnorm' if fast_normalization else ''} "
         f"{siril_path_option('out', master_stack_path().with_suffix(''))}"
     )
+    remove_unrequested_rejection_maps(output_dir, master_stack_path().stem, master_map_requests)
     report_progress(97.5, 98, "Finalizing master stack")
     execute_siril(f"cd {siril_path(output_dir)}")
     execute_siril(f"mirrorx_single {master_stack_path().stem}")
     artifact = require_siril_artifact(master_stack_path(), 'Master stack artifact')
     if quality_report is not None:
         quality_report["master"] = parse_stack_quality(master_response)
+        quality_report['master']['rejection_map_diagnostics'] = rejection_map_diagnostics(
+            {
+                direction: output_dir / f'{master_stack_path().stem}_{direction}_rejmap.fit'
+                for direction in ('low', 'high')
+            },
+            requested=master_map_requests,
+            unavailable_reason=(
+                'rejection_disabled' if pixel_rejection_method == 'none' else None
+            ),
+        )
         quality_report["master"]["method"] = "registered substack integration"
         quality_report["master"]["path"] = str(master_stack_path())
         quality_report["master"]["weight"] = "nbstack"
@@ -4845,7 +5526,12 @@ def build_parser():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--siril-exe", type=Path, default=siril_exe)
     parser.add_argument("--siril-open-timeout", type=float, default=siril_open_timeout)
-    parser.add_argument("--siril-command-timeout", type=float, default=siril_command_timeout)
+    parser.add_argument(
+        "--siril-command-timeout",
+        type=float,
+        default=siril_command_timeout,
+        help="maximum seconds to wait for each Siril command; 0 waits indefinitely",
+    )
     parser.add_argument("--cancel-file", type=Path)
     parser.add_argument(
         "--test-frame-count",
@@ -4965,6 +5651,18 @@ def build_parser():
         "--rejection-method", choices=PIXEL_REJECTION_METHODS, default=pixel_rejection_method
     )
     parser.add_argument(
+        "--low-rejection-map",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="write the low rejection map; by default follows the rejection method",
+    )
+    parser.add_argument(
+        "--high-rejection-map",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="write the high rejection map; by default follows the rejection method",
+    )
+    parser.add_argument(
         "--fast-normalization",
         action=argparse.BooleanOptionalAction,
         default=fast_normalization,
@@ -5062,6 +5760,7 @@ def configure(arguments):
     global background_method, background_samples, background_tolerance
     global filter_bkg, filter_nbstars, filter_round, filter_fwhm
     global stacking_weight, feather_val, rej_low, rej_high, pixel_rejection_method
+    global low_rejection_map_enabled, high_rejection_map_enabled
     global fast_normalization, catalog
     global memory_fraction, cpu_count, max_retries, skip_failed_frames
     global minimum_free_disk_gb
@@ -5156,6 +5855,8 @@ def configure(arguments):
     rej_low = str(arguments.rejection_low)
     rej_high = str(arguments.rejection_high)
     pixel_rejection_method = arguments.rejection_method
+    low_rejection_map_enabled = arguments.low_rejection_map
+    high_rejection_map_enabled = arguments.high_rejection_map
     fast_normalization = arguments.fast_normalization
     catalog = arguments.catalog
     memory_fraction = str(arguments.memory)

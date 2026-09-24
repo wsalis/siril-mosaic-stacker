@@ -8,7 +8,7 @@ A completed run is more than the final master. The artifacts below are designed 
 | `master_stack_<run_id>_cropped.fit` | Optional crop produced from the integration-time map. | No |
 | `coverage_map_<run_id>.fit` | Normalized 0-1 view of integration coverage. | No |
 | `integration_time_map_<run_id>.fit` | Seconds per pixel used for measurement and cropping. | No |
-| `*_low_rejmap.fit`, `*_high_rejmap.fit` | Pixel-rejection diagnostics. | No |
+| `*_low_rejmap.fit`, `*_high_rejmap.fit` | Pixel-rejection diagnostic maps. Quality reports summarize finite positive map locations and per-channel map values; affected locations are not counts of rejected input samples. Missing or unreadable maps are reported as unavailable. | No |
 | `quality_report_<run_id>.json` | Run settings, outcomes, metrics, cohorts, exposure, and artifact paths. | No |
 | `verification_<run_id>.json` | Automatic PASS/WARN/FAIL audit of the completed report and its evidence. | No |
 | `input_manifest_<run_id>.json` | Selected files, sizes, timestamps, SHA-256 fingerprints, cohorts, seed, and configuration hash. | No |
